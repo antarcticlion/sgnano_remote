@@ -50,6 +50,10 @@ public slots:
     void requestDrives();
     void requestList(const QString &path);
     void requestStat(const QString &path);
+    // ファイルの操作（2026-10-23、sgnano の遠隔コマンド DEL / REN / MKDIR）。結果は operationSucceeded か requestFailed
+    void requestDelete(const QString &path);
+    void requestRename(const QString &path, const QString &newName);
+    void requestMkdir(const QString &path);
 
 signals:
     void transmit(const QByteArray &data);
@@ -60,6 +64,7 @@ signals:
     void entryReceived(const RemoteEntry &entry);
     void listFinished(int count, bool truncated);
     void statReceived(const RemoteStat &stat);
+    void operationSucceeded(const QString &operation, const QString &path);   // operation = DEL / REN / MKDIR、path は実機が返した結果のパス
     void requestFailed(const QString &command, int code, const QString &message);
     void requestTimedOut(const QString &command);
     void consoleLine(const QString &line);
@@ -72,17 +77,21 @@ private:
         Cwd,
         Drives,
         List,
-        Stat
+        Stat,
+        Delete,
+        Rename,
+        Mkdir
     };
 
     struct Request
     {
         RequestType type = RequestType::Ping;
         QString argument;
+        QString argument2;          // REN の新しい名前
         QString command;
     };
 
-    void enqueue(RequestType type, const QString &argument = QString());
+    void enqueue(RequestType type, const QString &argument = QString(), const QString &argument2 = QString());
     void pump();
     void completeCurrent();
     void failCurrent(int code, const QString &message);
@@ -94,6 +103,7 @@ private:
     void handleListEntry(const QList<QByteArray> &fields);
     void handleStat(const QList<QByteArray> &fields);
     void handleError(const QList<QByteArray> &fields);
+    void handleOk(const QList<QByteArray> &fields);
     void finishList(int count, bool truncated);
 
     QTimer *m_timeout = nullptr;

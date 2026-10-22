@@ -188,11 +188,40 @@ void RemoteProtocol::requestStat(const QString &path)
     enqueue(RequestType::Stat, path);
 }
 
-void RemoteProtocol::enqueue(RequestType type, const QString &argument)
+void RemoteProtocol::requestDelete(const QString &path)
+{
+    enqueue(RequestType::Delete, path);
+}
+
+void RemoteProtocol::requestRename(const QString &path, const QString &newName)
+{
+    enqueue(RequestType::Rename, path, newName);
+}
+
+void RemoteProtocol::requestMkdir(const QString &path)
+{
+    enqueue(RequestType::Mkdir, path);
+}
+
+namespace {
+
+bool hasControl(const QString &s)
+{
+    for (const QChar c : s) {
+        if (c.unicode() < 0x20 || c.unicode() == 0x7F)
+            return true;
+    }
+    return false;
+}
+
+}
+
+void RemoteProtocol::enqueue(RequestType type, const QString &argument, const QString &argument2)
 {
     Request request;
     request.type = type;
     request.argument = argument;
+    request.argument2 = argument2;
 
     switch (type) {
     case RequestType::Ping:
@@ -221,6 +250,24 @@ void RemoteProtocol::enqueue(RequestType type, const QString &argument)
         }
         request.command = argument.isEmpty() ? QStringLiteral("STAT")
                                              : QStringLiteral("STAT ") + argument;
+        break;
+    case RequestType::Delete:
+    case RequestType::Mkdir: {
+        const QString name = type == RequestType::Delete ? QStringLiteral("DEL") : QStringLiteral("MKDIR");
+        if (argument.trimmed().isEmpty() || hasControl(argument)) {
+            emit requestFailed(name, 2, tr("パスが空か、制御文字が含まれています"));
+            return;
+        }
+        request.command = name + QLatin1Char(' ') + argument;
+        break;
+    }
+    case RequestType::Rename:
+        // 実機は「元のパス<TAB>新しい名前」で受ける（名前に空白が入りうるのでタブで区切る）。新しい側が名前だけなら同じフォルダの中
+        if (argument.trimmed().isEmpty() || argument2.trimmed().isEmpty() || hasControl(argument) || hasControl(argument2)) {
+            emit requestFailed(QStringLiteral("REN"), 2, tr("名前が空か、制御文字が含まれています"));
+            return;
+        }
+        request.command = QStringLiteral("REN ") + argument + QLatin1Char('\t') + argument2;
         break;
     }
 
@@ -266,6 +313,9 @@ void RemoteProtocol::pump()
         timeout = 2500;
     else if (m_current.type == RequestType::List || m_current.type == RequestType::Stat)
         timeout = 10000;
+    else if (m_current.type == RequestType::Delete || m_current.type == RequestType::Rename
+             || m_current.type == RequestType::Mkdir)
+        timeout = 35000;    // 実機は 1 回の操作を最長 30 秒待つ（NTFS・大きいフォルダ）
 
     emit busyChanged(true);
     m_timeout->start(timeout);
@@ -482,6 +532,11 @@ void RemoteProtocol::handleFields(const QList<QByteArray> &fields)
         return;
     }
 
+    if (kind == "OK") {
+        handleOk(fields);
+        return;
+    }
+
     emit logMessage(tr("不明な応答: %1").arg(QString::fromUtf8(fields.join('\t'))));
 }
 
@@ -549,6 +604,27 @@ void RemoteProtocol::handleStat(const QList<QByteArray> &fields)
     }
 
     emit statReceived(stat);
+    completeCurrent();
+}
+
+void RemoteProtocol::handleOk(const QList<QByteArray> &fields)
+{
+    const bool expected = m_hasCurrent
+        && (m_current.type == RequestType::Delete || m_current.type == RequestType::Rename
+            || m_current.type == RequestType::Mkdir);
+    if (!expected || fields.size() < 4) {
+        emit logMessage(tr("予期しない OK 応答を受信しました: %1").arg(QString::fromUtf8(fields.join('\t'))));
+        return;
+    }
+    const QString op = QString::fromLatin1(fields.at(2));
+    const QString want = m_current.type == RequestType::Delete ? QStringLiteral("DEL")
+                       : m_current.type == RequestType::Rename ? QStringLiteral("REN")
+                                                                : QStringLiteral("MKDIR");
+    if (op != want) {
+        emit logMessage(tr("予期しない OK 応答を受信しました: %1").arg(QString::fromUtf8(fields.join('\t'))));
+        return;
+    }
+    emit operationSucceeded(op, decodeField(fields.at(3)));
     completeCurrent();
 }
 

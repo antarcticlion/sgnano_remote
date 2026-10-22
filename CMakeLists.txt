@@ -32,3 +32,15 @@ target_include_directories(sgnano_remote PRIVATE src)
 target_compile_options(sgnano_remote PRIVATE -Wall -Wextra -Wpedantic)
 
 install(TARGETS sgnano_remote RUNTIME DESTINATION bin)
+
+# 試し（2026-10-23）: 実機なしでプロトコルの口を、--device で実機の DEL / REN / MKDIR を確かめる
+add_executable(sgnano_remote_selftest
+    tests/protocol_selftest.cpp
+    src/remoteprotocol.cpp
+    src/remoteprotocol.h
+    src/seriallink.cpp
+    src/seriallink.h
+)
+target_link_libraries(sgnano_remote_selftest PRIVATE Qt6::Core)
+target_include_directories(sgnano_remote_selftest PRIVATE src)
+target_compile_options(sgnano_remote_selftest PRIVATE -Wall -Wextra -Wpedantic)

@@ -42,6 +42,10 @@ public slots:
     void refreshRemote();
     void refreshRemoteAt(const QString &path);
     void goUpRemote();
+    // ファイルの操作（2026-10-23）: 選んだ項目を消す（確かめる）・名前を変える・表示中のフォルダに新しいフォルダを作る
+    void deleteSelected();
+    void renameSelected();
+    void createFolder();
 
 signals:
     void connectionStateChanged(bool connected, const QString &description);
@@ -70,6 +74,8 @@ private slots:
     void openRemoteIndex(const QModelIndex &index);
     void onDriveActivated(int index);
     void updateTransferButtons();
+    void onOperationSucceeded(const QString &operation, const QString &path);
+    void showContextMenu(const QPoint &pos);
 
 private:
     void buildUi();
@@ -80,6 +86,9 @@ private:
     void populateTree();
     void applyRemotePath(const QString &path);
     void syncDriveCombo();
+    struct SelectedItem { QString name; bool isDir = false; };
+    QList<SelectedItem> selectedItems() const;
+    void finishOperations();
 
     SerialLink *m_link = nullptr;
     RemoteProtocol *m_protocol = nullptr;
@@ -92,6 +101,9 @@ private:
     QPushButton *m_refreshButton = nullptr;
     QPushButton *m_uploadButton = nullptr;
     QPushButton *m_downloadButton = nullptr;
+    QPushButton *m_mkdirButton = nullptr;
+    QPushButton *m_renameButton = nullptr;
+    QPushButton *m_deleteButton = nullptr;
     QLabel *m_statusLabel = nullptr;
     QLineEdit *m_remotePath = nullptr;
     QLabel *m_hint = nullptr;
@@ -109,4 +121,6 @@ private:
     bool m_cancelingStray = false;
     quint64 m_openGeneration = 0;
     quint64 m_rxBytes = 0;
+    int m_opsPending = 0;           // 返事を待っている DEL / REN / MKDIR の数（0 になったら一覧を読み直す）
+    QStringList m_opErrors;         // そのまとまりの失敗（終わったらまとめて出す）
 };

@@ -21,6 +21,11 @@
 #include <QLocale>
 #include <QPushButton>
 #include <QItemSelectionModel>
+#include <QInputDialog>
+#include <QKeySequence>
+#include <QMenu>
+#include <QMessageBox>
+#include <QShortcut>
 #include <QMimeData>
 #include <QSettings>
 #include <QSortFilterProxyModel>
@@ -288,6 +293,7 @@ RemotePane::RemotePane(QWidget *parent)
     connect(m_protocol, &RemoteProtocol::entryReceived, this, &RemotePane::onEntryReceived);
     connect(m_protocol, &RemoteProtocol::listFinished, this, &RemotePane::onListFinished);
     connect(m_protocol, &RemoteProtocol::statReceived, this, &RemotePane::onStatReceived);
+    connect(m_protocol, &RemoteProtocol::operationSucceeded, this, &RemotePane::onOperationSucceeded);
     connect(m_protocol, &RemoteProtocol::requestFailed, this, &RemotePane::onRequestFailed);
     connect(m_protocol, &RemoteProtocol::requestTimedOut, this, &RemotePane::onRequestTimedOut);
     connect(m_protocol, &RemoteProtocol::consoleLine, this, &RemotePane::onConsoleLine);
@@ -392,10 +398,26 @@ void RemotePane::buildUi()
     m_downloadButton->setEnabled(false);
     m_downloadButton->setToolTip(tr("右ペインで選択したファイルをローカルの現在のフォルダへ受け取ります（ZMODEM）"));
 
+    m_mkdirButton = new QPushButton(tr("新しいフォルダ"), this);
+    m_mkdirButton->setEnabled(false);
+    m_mkdirButton->setToolTip(tr("表示中のフォルダに新しいフォルダを作ります"));
+
+    m_renameButton = new QPushButton(tr("名前の変更"), this);
+    m_renameButton->setEnabled(false);
+    m_renameButton->setToolTip(tr("選択した項目の名前を変えます（F2）"));
+
+    m_deleteButton = new QPushButton(tr("削除"), this);
+    m_deleteButton->setEnabled(false);
+    m_deleteButton->setToolTip(tr("選択した項目を消します（Delete）。フォルダは空のときだけ消せます"));
+
     auto *actionRow = new QHBoxLayout;
     actionRow->setContentsMargins(0, 0, 0, 0);
     actionRow->addWidget(m_upButton);
     actionRow->addWidget(m_refreshButton);
+    actionRow->addSpacing(12);
+    actionRow->addWidget(m_mkdirButton);
+    actionRow->addWidget(m_renameButton);
+    actionRow->addWidget(m_deleteButton);
     actionRow->addStretch(1);
     actionRow->addWidget(m_uploadButton);
     actionRow->addWidget(m_downloadButton);
@@ -486,6 +508,15 @@ void RemotePane::buildUi()
     connect(m_driveCombo, &QComboBox::activated, this, &RemotePane::onDriveActivated);
     connect(m_remotePath, &QLineEdit::returnPressed, this, &RemotePane::navigateRemotePath);
     connect(m_tree, &QTreeView::activated, this, &RemotePane::openRemoteIndex);
+    connect(m_mkdirButton, &QPushButton::clicked, this, &RemotePane::createFolder);
+    connect(m_renameButton, &QPushButton::clicked, this, &RemotePane::renameSelected);
+    connect(m_deleteButton, &QPushButton::clicked, this, &RemotePane::deleteSelected);
+    m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_tree, &QWidget::customContextMenuRequested, this, &RemotePane::showContextMenu);
+    auto *renameKey = new QShortcut(QKeySequence(Qt::Key_F2), m_tree, nullptr, nullptr, Qt::WidgetShortcut);
+    connect(renameKey, &QShortcut::activated, this, &RemotePane::renameSelected);
+    auto *deleteKey = new QShortcut(QKeySequence::Delete, m_tree, nullptr, nullptr, Qt::WidgetShortcut);
+    connect(deleteKey, &QShortcut::activated, this, &RemotePane::deleteSelected);
     connect(m_tree->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &RemotePane::updateTransferButtons);
     connect(m_link, &SerialLink::closed, this, &RemotePane::updateCounters);
@@ -713,6 +744,11 @@ void RemotePane::onRequestFailed(const QString &command, int code, const QString
         m_model->removeRows(0, m_model->rowCount());
         m_hint->setText(tr("一覧を取得できません: %1").arg(message));
         syncDriveCombo();
+    } else if (command.startsWith(QStringLiteral("DEL")) || command.startsWith(QStringLiteral("REN"))
+               || command.startsWith(QStringLiteral("MKDIR"))) {
+        m_opErrors.append(tr("%1: %2").arg(command.section(QLatin1Char(' '), 1).replace(QLatin1Char('\t'), QStringLiteral(" → ")), message));
+        if (m_opsPending > 0 && --m_opsPending == 0)
+            finishOperations();
     } else if (command.startsWith(QStringLiteral("CWD"))) {
         m_hint->setText(tr("現在のフォルダを取得できません: %1").arg(message));
     } else if (command.startsWith(QStringLiteral("DRIVES"))) {
@@ -722,6 +758,11 @@ void RemotePane::onRequestFailed(const QString &command, int code, const QString
 
 void RemotePane::onRequestTimedOut(const QString &command)
 {
+    if (m_opsPending > 0) {      // 時間切れは待ち行列を捨てるので、残りの操作もまとめて終わりにする
+        m_opErrors.append(tr("%1: 応答がありません").arg(command));
+        m_opsPending = 0;
+        finishOperations();
+    }
     emit logMessage(tr("%1 の応答がタイムアウトしました").arg(command));
     if (command.startsWith(QStringLiteral("LIST"))) {
         m_entries.clear();
@@ -955,6 +996,132 @@ void RemotePane::updateTransferButtons()
     m_upButton->setEnabled(idle && !m_remotePathText.isEmpty());
     m_uploadButton->setEnabled(idle && !m_remotePathText.isEmpty());
     m_downloadButton->setEnabled(idle && !selectedRemoteFiles().isEmpty());
+    const int selected = int(selectedItems().size());
+    m_mkdirButton->setEnabled(idle && !m_remotePathText.isEmpty());
+    m_renameButton->setEnabled(idle && selected == 1);
+    m_deleteButton->setEnabled(idle && selected > 0);
+}
+
+QList<RemotePane::SelectedItem> RemotePane::selectedItems() const
+{
+    QList<SelectedItem> items;
+    if (!m_tree->selectionModel())
+        return items;
+    for (const QModelIndex &index : m_tree->selectionModel()->selectedRows(0)) {
+        const QString name = index.data(NameRole).toString();
+        if (!name.isEmpty())
+            items.append({ name, index.data(IsDirRole).toBool() });
+    }
+    return items;
+}
+
+void RemotePane::showContextMenu(const QPoint &pos)
+{
+    QMenu menu(this);
+    QAction *mk = menu.addAction(tr("新しいフォルダ…"), this, &RemotePane::createFolder);
+    QAction *rn = menu.addAction(tr("名前の変更…"), this, &RemotePane::renameSelected);
+    rn->setShortcut(QKeySequence(Qt::Key_F2));
+    QAction *dl = menu.addAction(tr("削除…"), this, &RemotePane::deleteSelected);
+    dl->setShortcut(QKeySequence::Delete);
+    menu.addSeparator();
+    menu.addAction(tr("更新"), this, &RemotePane::refreshRemote);
+    mk->setEnabled(m_mkdirButton->isEnabled());
+    rn->setEnabled(m_renameButton->isEnabled());
+    dl->setEnabled(m_deleteButton->isEnabled());
+    menu.exec(m_tree->viewport()->mapToGlobal(pos));
+}
+
+void RemotePane::createFolder()
+{
+    if (!m_mkdirButton->isEnabled())
+        return;
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, tr("新しいフォルダ"),
+                                               tr("%1 に作るフォルダの名前:").arg(m_remotePathText),
+                                               QLineEdit::Normal, tr("新しいフォルダ"), &ok).trimmed();
+    if (!ok || name.isEmpty())
+        return;
+    if (name.contains(QLatin1Char('/')) || name.contains(QLatin1Char(':')) || name == QStringLiteral(".")
+        || name == QStringLiteral("..")) {
+        QMessageBox::warning(this, tr("新しいフォルダ"), tr("名前に / や : は使えません。"));
+        return;
+    }
+    m_opErrors.clear();
+    m_opsPending = 1;
+    emit logMessage(tr("フォルダを作ります: %1").arg(joinRemotePath(m_remotePathText, name)));
+    m_protocol->requestMkdir(joinRemotePath(m_remotePathText, name));
+}
+
+void RemotePane::renameSelected()
+{
+    if (!m_renameButton->isEnabled())
+        return;
+    const QList<SelectedItem> items = selectedItems();
+    if (items.size() != 1)
+        return;
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, tr("名前の変更"), tr("新しい名前:"), QLineEdit::Normal,
+                                               items.first().name, &ok).trimmed();
+    if (!ok || name.isEmpty() || name == items.first().name)
+        return;
+    if (name.contains(QLatin1Char('/')) || name.contains(QLatin1Char(':'))) {
+        QMessageBox::warning(this, tr("名前の変更"), tr("名前に / や : は使えません（同じフォルダの中でだけ変えられます）。"));
+        return;
+    }
+    m_opErrors.clear();
+    m_opsPending = 1;
+    emit logMessage(tr("名前を変えます: %1 → %2").arg(items.first().name, name));
+    m_protocol->requestRename(joinRemotePath(m_remotePathText, items.first().name), name);
+}
+
+void RemotePane::deleteSelected()
+{
+    if (!m_deleteButton->isEnabled())
+        return;
+    const QList<SelectedItem> items = selectedItems();
+    if (items.isEmpty())
+        return;
+    QStringList names;
+    for (const SelectedItem &it : items)
+        names.append(it.isDir ? it.name + QLatin1Char('/') : it.name);
+    const int shown = 12;
+    QString list = QStringList(names.mid(0, shown)).join(QLatin1Char('\n'));
+    if (names.size() > shown)
+        list += tr("\n…ほか %1 項目").arg(names.size() - shown);
+    const auto answer = QMessageBox::question(
+        this, tr("削除"),
+        tr("%1 の %2 項目を消します。元に戻せません。\n\n%3\n\n（フォルダは空のときだけ消せます）")
+            .arg(m_remotePathText).arg(items.size()).arg(list),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes)
+        return;
+    m_opErrors.clear();
+    m_opsPending = int(items.size());
+    for (const SelectedItem &it : items) {
+        emit logMessage(tr("消します: %1").arg(joinRemotePath(m_remotePathText, it.name)));
+        m_protocol->requestDelete(joinRemotePath(m_remotePathText, it.name));
+    }
+}
+
+void RemotePane::onOperationSucceeded(const QString &operation, const QString &path)
+{
+    emit logMessage(tr("%1 しました: %2").arg(operation == QStringLiteral("DEL") ? tr("削除")
+                                              : operation == QStringLiteral("REN") ? tr("名前を変更")
+                                                                                     : tr("フォルダを作成"),
+                                              path));
+    if (m_opsPending > 0 && --m_opsPending == 0)
+        finishOperations();
+}
+
+void RemotePane::finishOperations()
+{
+    if (!m_remotePathText.isEmpty())
+        requestList(m_remotePathText);
+    if (!m_opErrors.isEmpty()) {
+        const QString text = m_opErrors.join(QLatin1Char('\n'));
+        m_opErrors.clear();
+        QMessageBox::warning(this, tr("リモートの操作"), tr("できなかった操作があります:\n\n%1").arg(text));
+    }
 }
 
 QString RemotePane::currentRemotePath() const
