@@ -22,6 +22,8 @@ add_executable(sgnano_remote
     src/remotepane.h
     src/remotedeletequeue.cpp
     src/remotedeletequeue.h
+    src/remotefs.cpp
+    src/remotefs.h
     src/remoteprotocol.cpp
     src/remoteprotocol.h
     src/seriallink.cpp
@@ -43,6 +45,8 @@ if(BUILD_TESTING)
         tests/protocol_selftest.cpp
         src/remotedeletequeue.cpp
         src/remotedeletequeue.h
+        src/remotefs.cpp
+        src/remotefs.h
         src/remoteprotocol.cpp
         src/remoteprotocol.h
         src/seriallink.cpp

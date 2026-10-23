@@ -1,10 +1,13 @@
-// sgnano_remote の試し（2026-10-23）。
+// sgnano_remote の試し（2026-10-23、2026-10-24 に S: を追加）。
 //   sgnano_remote_selftest                      … 実機なし: RemoteProtocol に答えを流し込み、DEL / REN / MKDIR の送る行と OK / ERR の受け取りを確かめる。
-//                                                  RemoteDeleteQueue の 8 件ずつの送信・途中失敗・タイムアウトも確かめる
+//                                                  RemoteDeleteQueue の 8 件ずつの送信・途中失敗・タイムアウトも確かめる。
+//                                                  S: の見分けとシステムのフォルダの守り（src/remotefs.cpp）も確かめる
 //   sgnano_remote_selftest --device /dev/ttyACM0 … 実機あり: DRIVES の種類で HDD の exFAT（3）と NTFS（4）を選び、作る・名前を変える・消すを通す。
-//                                                  作ったものは消してから終わる。FAT（1）には書かない（ドライブ文字はつなぐ順で変わるので、種類で選ぶ）
+//                                                  作ったものは消してから終わる。FAT（1）には書かない（ドライブ文字はつなぐ順で変わるので、種類で選ぶ）。
+//                                                  S:（内蔵フラッシュ）と 3 つのシステムのフォルダは見るだけ
 //   sgnano_remote_selftest --device-many /dev/ttyACM0 … 実機あり: 34 個のフォルダを 8 件ずつ消せることを確かめる
 #include "remotedeletequeue.h"
+#include "remotefs.h"
 #include "remoteprotocol.h"
 #include "seriallink.h"
 
@@ -32,11 +35,14 @@ struct Probe
 {
     QList<QByteArray> sent;
     QStringList ok, failed, logs;
+    QList<RemoteDrive> drives;
 };
 
 void hookProbe(RemoteProtocol &p, Probe &pr)
 {
     QObject::connect(&p, &RemoteProtocol::transmit, [&pr](const QByteArray &d) { pr.sent.append(d); });
+    QObject::connect(&p, &RemoteProtocol::drivesReceived,
+                     [&pr](const QList<RemoteDrive> &d) { pr.drives = d; });
     QObject::connect(&p, &RemoteProtocol::operationSucceeded,
                      [&pr](const QString &op, const QString &path) { pr.ok.append(op + QLatin1Char('|') + path); });
     QObject::connect(&p, &RemoteProtocol::requestFailed, [&pr](const QString &c, int code, const QString &m) {
@@ -113,6 +119,47 @@ void offlineTests()
     check(fullProbe.sent.size() == 1 && fullProbe.failed.size() == 1
               && fullProbe.failed.last().startsWith(QStringLiteral("DEL B:/q33|3|")),
           QStringLiteral("待ち行列がいっぱいなら requestFailed で返す"));
+}
+
+// ---- S: のシステムのドライブ（sgnano 本体 2026-10-24） ----
+void systemDriveTests()
+{
+    // 本体（src/storage/sysdisk.c の sysdisk_protected）と同じ見分け方
+    check(RemoteFs::isSystemDrivePath(QStringLiteral("S:/")), QStringLiteral("S:/ をシステムのドライブと見分ける"));
+    check(RemoteFs::isSystemDrivePath(QStringLiteral("s:/SystemFiles")), QStringLiteral("小文字の s: も見分ける"));
+    check(!RemoteFs::isSystemDrivePath(QStringLiteral("A:/")), QStringLiteral("A: はシステムのドライブではない"));
+    check(!RemoteFs::isSystemDrivePath(QStringLiteral("S")), QStringLiteral("S（コロンなし）はパスではない"));
+
+    for (const QString &name : RemoteFs::protectedSystemFolders()) {
+        check(RemoteFs::isProtectedSystemPath(QStringLiteral("S:/") + name),
+              QStringLiteral("S:/%1 はシステムのフォルダ").arg(name));
+    }
+    check(RemoteFs::isProtectedSystemPath(QStringLiteral("s:/systemfiles/")),
+          QStringLiteral("大文字小文字・終わりの / を無視して見分ける"));
+    check(!RemoteFs::isProtectedSystemPath(QStringLiteral("S:/SystemSettings/foo")),
+          QStringLiteral("システムのフォルダの中は守らない"));
+    check(!RemoteFs::isProtectedSystemPath(QStringLiteral("A:/SystemSettings")),
+          QStringLiteral("S: 以外の同名フォルダは守らない"));
+    check(!RemoteFs::isProtectedSystemPath(QStringLiteral("S:/SystemSettings2")),
+          QStringLiteral("名前が違えば守らない"));
+    check(!RemoteFs::isProtectedSystemPath(QStringLiteral("S:/")),
+          QStringLiteral("S: のルートは守らない"));
+
+    // DRIVES の S:（本体は種類 FAT = 1、最後の 1 つとして返す）
+    RemoteProtocol p;
+    Probe pr;
+    hookProbe(p, pr);
+    p.sync();
+    p.feed("@SG\tPONG\tSGNANO\r\n");
+    p.requestDrives();
+    p.feed("@SG\tDRV\tA\t3\t1\r\n"
+           "@SG\tDRV\tS\t1\t1\r\n"
+           "@SG\tDRIVES\tEND\t2\r\n");
+    check(pr.drives.size() == 2
+              && pr.drives.at(0).letter == QStringLiteral("A") && !pr.drives.at(0).isSystem()
+              && pr.drives.at(1).letter == QStringLiteral("S") && pr.drives.at(1).isSystem()
+              && pr.drives.at(1).type == 1 && pr.drives.at(1).ready && !p.isBusy(),
+          QStringLiteral("DRIVES で S:（内蔵フラッシュ、FAT）を読む"));
 }
 
 // ---- 一括削除の順番（RemotePane から切り出した RemoteDeleteQueue） ----
@@ -403,6 +450,32 @@ void deviceTests(const QString &port)
     QString letters;
     for (const RemoteDrive &r : d.drives) letters += QStringLiteral("%1=%2 ").arg(r.letter).arg(r.type);
     std::printf("    drives: %s\n", qPrintable(letters));
+
+    // S:（内蔵フラッシュ）と、そのルートのシステムのフォルダ。消す・名前を変える試しはしない
+    // （古い本体や不具合のある本体で本当に消えてしまわないよう、見るだけにする。アプリが名前で断ることは
+    //  実機なしの試し（RemoteFs::isProtectedSystemPath）で確かめる）
+    const RemoteDrive *systemDrive = nullptr;
+    for (const RemoteDrive &r : d.drives) {
+        if (r.isSystem())
+            systemDrive = &r;
+    }
+    check(systemDrive && systemDrive->ready, QStringLiteral("S:（内蔵フラッシュ）がある"));
+    if (systemDrive && systemDrive->ready) {
+        const QString root = systemDrive->letter + QStringLiteral(":/");
+        QStringList names;
+        check(d.listNames(root, &names), QStringLiteral("S: のルートを読む"));
+        for (const QString &name : RemoteFs::protectedSystemFolders()) {
+            bool found = false;
+            bool isDir = false;
+            uint attr = 0;
+            for (const RemoteEntry &e : d.entries) {
+                if (e.name == name) { found = true; isDir = e.isDir; attr = e.attr; break; }
+            }
+            check(found && isDir, QStringLiteral("S:/%1 がある").arg(name));
+            check(found && (attr & 0x04) != 0, QStringLiteral("S:/%1 はシステムの属性").arg(name));
+        }
+    }
+
     for (int type : { 3, 4 }) {
         QString drv;
         int n = 0;
@@ -547,6 +620,7 @@ int main(int argc, char **argv)
     QCoreApplication app(argc, argv);
     const QStringList args = app.arguments();
     offlineTests();
+    systemDriveTests();
     deleteQueueTests();
     const int many = int(args.indexOf(QStringLiteral("--device-many")));
     if (many > 0 && many + 1 < args.size())

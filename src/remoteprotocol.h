@@ -12,6 +12,14 @@ struct RemoteDrive
     QString letter;
     int type = 0;
     bool ready = false;
+
+    // sgnano 本体（2026-10-24）では S: は内蔵フラッシュのシステムのドライブに決まっている。
+    // USB のドライブは A から順に S を飛ばすので、文字だけで見分けられる。
+    bool isSystem() const
+    {
+        return letter.size() == 1
+            && (letter.at(0) == QLatin1Char('S') || letter.at(0) == QLatin1Char('s'));
+    }
 };
 
 struct RemoteEntry

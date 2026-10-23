@@ -1,6 +1,7 @@
 #include "remotepane.h"
 
 #include "remotedeletequeue.h"
+#include "remotefs.h"
 #include "seriallink.h"
 #include "transfermime.h"
 
@@ -132,9 +133,13 @@ QStringList scanSerialPorts()
     return result;
 }
 
-QString driveTypeText(int type)
+QString driveTypeText(const RemoteDrive &drive)
 {
-    switch (type) {
+    // S: は本体の内蔵フラッシュ（FAT12、2MB）。DRIVES の種類は FAT（1）で返るので、文字で見分ける。
+    if (drive.isSystem())
+        return QStringLiteral("内蔵フラッシュ (FAT12)");
+
+    switch (drive.type) {
     case 1: return QStringLiteral("FAT");
     case 2: return QStringLiteral("FAT (FD)");
     case 3: return QStringLiteral("exFAT");
@@ -385,7 +390,7 @@ void RemotePane::buildUi()
 
     m_remotePath = new QLineEdit(this);
     m_remotePath->setClearButtonEnabled(true);
-    m_remotePath->setPlaceholderText(tr("リモートのパス（A:/…）"));
+    m_remotePath->setPlaceholderText(tr("リモートのパス（A:/…、S:/…）"));
     m_remotePath->setToolTip(tr("パスを入力して Enter で移動"));
 
     m_counters = new QLabel(this);
@@ -698,14 +703,23 @@ void RemotePane::onDrivesReceived(const QList<RemoteDrive> &drives)
     m_updatingDrives = true;
     m_driveCombo->clear();
     for (const RemoteDrive &drive : drives) {
-        QString label = QStringLiteral("%1:  %2").arg(drive.letter, driveTypeText(drive.type));
-        if (!drive.ready)
-            label += tr("（未挿入）");
+        QString label = QStringLiteral("%1:  %2").arg(drive.letter, driveTypeText(drive));
+        if (!drive.ready) {
+            label += drive.isSystem() ? tr("（準備できていません）") : tr("（未挿入）");
+        }
         m_driveCombo->addItem(label, drive.letter);
+        const int index = m_driveCombo->count() - 1;
+        if (drive.isSystem()) {
+            m_driveCombo->setItemData(index,
+                                      tr("S: は内蔵フラッシュのシステムのドライブです。"
+                                         "SystemSettings・SystemFiles・SystemLogs は消せません・名前を変えられません"),
+                                      Qt::ToolTipRole);
+        }
+        QString readiness = tr("準備完了");
+        if (!drive.ready)
+            readiness = drive.isSystem() ? tr("準備できていません") : tr("未挿入");
         emit logMessage(tr("ドライブ %1: %2 (%3)")
-                            .arg(drive.letter,
-                                 driveTypeText(drive.type),
-                                 drive.ready ? tr("準備完了") : tr("未挿入")));
+                            .arg(drive.letter, driveTypeText(drive), readiness));
     }
     m_updatingDrives = false;
     syncDriveCombo();
@@ -958,6 +972,9 @@ void RemotePane::populateTree()
         nameItem->setEditable(false);
         nameItem->setDragEnabled(!entry.isDir);
         nameItem->setDropEnabled(false);
+        if (RemoteFs::isProtectedSystemPath(joinRemotePath(m_remotePathText, entry.name))) {
+            nameItem->setToolTip(tr("システムのフォルダ（消せません・名前を変えられません）"));
+        }
 
         auto *sizeItem = new QStandardItem(
             entry.isDir ? QString() : QLocale().formattedDataSize(qint64(entry.size), 1));
@@ -994,7 +1011,7 @@ void RemotePane::applyRemotePath(const QString &path)
     m_remotePathText = path;
     m_tree->setProperty("remoteBasePath", path);
     m_remotePath->setText(path);
-    m_remotePath->setPlaceholderText(tr("リモートのパス（A:/…）"));
+    m_remotePath->setPlaceholderText(tr("リモートのパス（A:/…、S:/…）"));
     syncDriveCombo();
     updateTransferButtons();
 }
@@ -1034,10 +1051,18 @@ void RemotePane::updateTransferButtons()
     m_upButton->setEnabled(idle && !m_remotePathText.isEmpty());
     m_uploadButton->setEnabled(idle && !m_remotePathText.isEmpty());
     m_downloadButton->setEnabled(idle && !selectedRemoteFiles().isEmpty());
-    const int selected = int(selectedItems().size());
+    const QList<SelectedItem> items = selectedItems();
+    const int selected = int(items.size());
+    const bool protectedSelected = !protectedSystemNames(items).isEmpty();
     m_mkdirButton->setEnabled(idle && !m_remotePathText.isEmpty());
     m_renameButton->setEnabled(idle && selected == 1);
     m_deleteButton->setEnabled(idle && selected > 0);
+    m_renameButton->setToolTip(protectedSelected
+                                   ? tr("システムのフォルダ（SystemSettings・SystemFiles・SystemLogs）は名前を変えられません")
+                                   : tr("選択した項目の名前を変えます（F2）"));
+    m_deleteButton->setToolTip(protectedSelected
+                                   ? tr("システムのフォルダ（SystemSettings・SystemFiles・SystemLogs）は消せません")
+                                   : tr("選択した項目を消します（Delete）。フォルダは空のときだけ消せます"));
 }
 
 QList<RemotePane::SelectedItem> RemotePane::selectedItems() const
@@ -1051,6 +1076,16 @@ QList<RemotePane::SelectedItem> RemotePane::selectedItems() const
             items.append({ name, index.data(IsDirRole).toBool() });
     }
     return items;
+}
+
+QStringList RemotePane::protectedSystemNames(const QList<SelectedItem> &items) const
+{
+    QStringList names;
+    for (const SelectedItem &item : items) {
+        if (RemoteFs::isProtectedSystemPath(joinRemotePath(m_remotePathText, item.name)))
+            names.append(item.name);
+    }
+    return names;
 }
 
 void RemotePane::showContextMenu(const QPoint &pos)
@@ -1129,6 +1164,14 @@ void RemotePane::renameSelected()
     const QList<SelectedItem> items = selectedItems();
     if (items.size() != 1)
         return;
+    const QString path = joinRemotePath(m_remotePathText, items.first().name);
+    if (RemoteFs::isProtectedSystemPath(path)) {
+        QMessageBox::warning(this, tr("名前の変更"),
+                             tr("S: のシステムのフォルダは名前を変えられません:\n\n%1\n\n"
+                                "（SystemSettings・SystemFiles・SystemLogs）")
+                                 .arg(items.first().name));
+        return;
+    }
     bool ok = false;
     const QString name = QInputDialog::getText(this, tr("名前の変更"), tr("新しい名前:"), QLineEdit::Normal,
                                                items.first().name, &ok).trimmed();
@@ -1141,7 +1184,7 @@ void RemotePane::renameSelected()
     clearOperations();
     m_opsPending = 1;
     emit logMessage(tr("名前を変えます: %1 → %2").arg(items.first().name, name));
-    m_protocol->requestRename(joinRemotePath(m_remotePathText, items.first().name), name);
+    m_protocol->requestRename(path, name);
 }
 
 void RemotePane::deleteSelected()
@@ -1153,6 +1196,14 @@ void RemotePane::deleteSelected()
     const QList<SelectedItem> items = selectedItems();
     if (items.isEmpty())
         return;
+    const QStringList protectedNames = protectedSystemNames(items);
+    if (!protectedNames.isEmpty()) {
+        QMessageBox::warning(this, tr("削除"),
+                             tr("S: のシステムのフォルダは消せません:\n\n%1\n\n"
+                                "（SystemSettings・SystemFiles・SystemLogs）")
+                                 .arg(protectedNames.join(QLatin1Char('\n'))));
+        return;
+    }
     QStringList names;
     for (const SelectedItem &it : items)
         names.append(it.isDir ? it.name + QLatin1Char('/') : it.name);
