@@ -2,13 +2,11 @@
 
 #include "localpane.h"
 #include "remotepane.h"
+#include "zmodemworker.h"
 
 #include <QAction>
 #include <QCloseEvent>
-#include <QCoreApplication>
-#include <QDir>
 #include <QDockWidget>
-#include <QFileInfo>
 #include <QFontDatabase>
 #include <QIcon>
 #include <QKeySequence>
@@ -18,20 +16,15 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPlainTextEdit>
-#include <QProcessEnvironment>
-#include <QRegularExpression>
 #include <QProgressDialog>
 #include <QSettings>
 #include <QSplitter>
-#include <QStandardPaths>
 #include <QStatusBar>
+#include <QThread>
 #include <QTime>
 #include <QTimer>
 
-#include <csignal>
 #include <limits>
-#include <sys/types.h>
-#include <unistd.h>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -104,7 +97,7 @@ void MainWindow::buildUi()
     auto *connectAction = remoteMenu->addAction(tr("接続/切断(&C)"));
     connectAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+C")));
     connect(connectAction, &QAction::triggered, this, [this] {
-        if (!m_zmodem)
+        if (!m_transfer)
             m_remotePane->toggleConnection();
     });
 
@@ -186,25 +179,6 @@ QString remoteParentPath(const QString &path)
     return clean.left(slash);
 }
 
-QString findZmodemScript()
-{
-    const QString fromEnv = qEnvironmentVariable("SGNANO_ZM");
-    if (!fromEnv.isEmpty() && QFileInfo(fromEnv).isFile())
-        return QFileInfo(fromEnv).absoluteFilePath();
-
-    const QString appDir = QCoreApplication::applicationDirPath();
-    const QStringList candidates = {
-        QDir(appDir).absoluteFilePath(QStringLiteral("../../sgnano/scripts/zm.py")),
-        QDir::current().absoluteFilePath(QStringLiteral("../sgnano/scripts/zm.py")),
-        QDir::current().absoluteFilePath(QStringLiteral("sgnano/scripts/zm.py")),
-    };
-    for (const QString &candidate : candidates) {
-        if (QFileInfo(candidate).isFile())
-            return QDir::cleanPath(candidate);
-    }
-    return QString();
-}
-
 }
 
 void MainWindow::startUpload()
@@ -228,7 +202,7 @@ void MainWindow::startUpload()
 
 void MainWindow::startUploadTo(const QStringList &files, const QString &remoteDir)
 {
-    if (m_zmodem || files.isEmpty() || remoteDir.isEmpty())
+    if (m_transfer || files.isEmpty() || remoteDir.isEmpty())
         return;
     if (!m_remotePane->isIdle()) {
         QMessageBox::information(this, tr("アップロード"),
@@ -268,7 +242,7 @@ void MainWindow::startDownload()
 
 void MainWindow::startDownloadFrom(const QString &remoteFile, const QString &localDir)
 {
-    if (m_zmodem || remoteFile.isEmpty() || localDir.isEmpty())
+    if (m_transfer || remoteFile.isEmpty() || localDir.isEmpty())
         return;
     if (!m_remotePane->isIdle()) {
         QMessageBox::information(this, tr("ダウンロード"),
@@ -291,7 +265,7 @@ void MainWindow::startDownloadFrom(const QString &remoteFile, const QString &loc
 void MainWindow::launchTransfer(bool download, const QStringList &files, const QString &localDir,
                                 const QString &remotePath)
 {
-    if (m_zmodem)
+    if (m_transfer)
         return;
 
     const QString title = download ? tr("ZMODEM ダウンロード")
@@ -303,49 +277,12 @@ void MainWindow::launchTransfer(bool download, const QStringList &files, const Q
         return;
     }
 
-    const QString script = findZmodemScript();
-    if (script.isEmpty()) {
-        QMessageBox::critical(this, title,
-                              tr("scripts/zm.py が見つかりません。SGNANO_ZM で場所を指定してください。"));
-        return;
-    }
-    const QString python = QStandardPaths::findExecutable(QStringLiteral("python3"));
-    if (python.isEmpty()) {
-        QMessageBox::critical(this, title, tr("python3 が見つかりません。"));
-        return;
-    }
-
     m_transferDownload = download;
-    m_transferPort = port;
-    m_transferBaud = baud;
     m_transferCanceled = false;
-    m_transferGroup = false;
     m_transferRefreshPath = download ? remoteParentPath(remotePath) : remotePath;
-
-    m_zmodem = new QProcess(this);
-    m_zmodem->setProcessChannelMode(QProcess::MergedChannels);
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    env.insert(QStringLiteral("SGNANO_TTY"), m_transferPort);
-    env.insert(QStringLiteral("SGNANO_BAUD"), QString::number(m_transferBaud));
-    m_zmodem->setProcessEnvironment(env);
-
-    connect(m_zmodem, &QProcess::readyReadStandardOutput, this, [this] {
-        if (!m_zmodem)
-            return;
-        consumeTransferOutput(m_zmodem->readAllStandardOutput());
-    });
-    connect(m_zmodem, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, &MainWindow::finishTransfer);
-    connect(m_zmodem, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
-        if (error == QProcess::FailedToStart && m_zmodem) {
-            appendLog(tr("ZMODEM を開始できません: %1").arg(m_zmodem->errorString()));
-            finishTransfer(127, QProcess::CrashExit);
-        }
-    });
 
     m_remotePane->disconnectRemote();
 
-    m_transferOutputBuffer.clear();
     m_transferProgressBaseText = download
         ? tr("ダウンロード中:\n%1\n→ %2").arg(remotePath, localDir)
         : tr("アップロード中:\n%1\n→ %2").arg(files.join(QStringLiteral(", ")), remotePath);
@@ -359,134 +296,75 @@ void MainWindow::launchTransfer(bool download, const QStringList &files, const Q
     connect(m_transferProgress, &QProgressDialog::canceled, this, &MainWindow::cancelTransfer);
     m_transferProgress->show();
 
-    QStringList args{ QStringLiteral("-u"), script };
-    if (download) {
-        args << QStringLiteral("get") << QStringLiteral("--remote-file") << remotePath << localDir;
-        appendLog(tr("ZMODEM ダウンロード: %1 -> %2").arg(remotePath, localDir));
-    } else {
-        args << QStringLiteral("put") << QStringLiteral("--remote-dir") << remotePath;
-        args += files;
-        appendLog(tr("ZMODEM アップロード: %1 -> %2").arg(files.join(QStringLiteral(", ")), remotePath));
-    }
-#ifdef Q_OS_UNIX
-    m_zmodem->setChildProcessModifier([] { ::setpgid(0, 0); });
-    m_transferGroup = true;
-#endif
-    m_zmodem->start(python, args);
+    if (download)
+        appendLog(tr("内蔵 ZMODEM ダウンロード: %1 -> %2").arg(remotePath, localDir));
+    else
+        appendLog(tr("内蔵 ZMODEM アップロード: %1 -> %2")
+                      .arg(files.join(QStringLiteral(", ")), remotePath));
+
+    auto *thread = new QThread(this);
+    auto *worker = new ZmodemWorker(port, baud,
+                                    download ? ZmodemWorker::Mode::Download
+                                             : ZmodemWorker::Mode::Upload,
+                                    files, localDir, remotePath);
+    worker->moveToThread(thread);
+    m_transfer = worker;
+
+    connect(thread, &QThread::started, worker, &ZmodemWorker::run);
+    connect(worker, &ZmodemWorker::progress, this, &MainWindow::onTransferProgress);
+    connect(worker, &ZmodemWorker::logMessage, this, &MainWindow::appendLog);
+    connect(worker, &ZmodemWorker::finished, this, &MainWindow::finishTransfer);
+    connect(worker, &ZmodemWorker::finished, thread, &QThread::quit);
+    connect(thread, &QThread::finished, worker, &QObject::deleteLater);
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+
+    thread->start();
 }
 
-void MainWindow::consumeTransferOutput(const QByteArray &data)
+void MainWindow::onTransferProgress(qint64 done, qint64 total)
 {
-    if (data.isEmpty())
+    if (!m_transferProgress || m_transferCanceled)
         return;
-
-    m_transferOutputBuffer += data;
-    int start = 0;
-    for (int i = 0; i < m_transferOutputBuffer.size(); ++i) {
-        const char c = m_transferOutputBuffer.at(i);
-        if (c != '\r' && c != '\n')
-            continue;
-        if (i > start)
-            handleTransferOutputLine(QString::fromLocal8Bit(m_transferOutputBuffer.mid(start, i - start)));
-        start = i + 1;
-    }
-    if (start > 0)
-        m_transferOutputBuffer.remove(0, start);
-    if (m_transferOutputBuffer.size() > 16384) {
-        handleTransferOutputLine(QString::fromLocal8Bit(m_transferOutputBuffer));
-        m_transferOutputBuffer.clear();
-    }
-}
-
-void MainWindow::handleTransferOutputLine(const QString &line)
-{
-    const QString text = line.trimmed();
-    if (text.isEmpty())
-        return;
-
-    // lrzsz は進捗を stderr に "\r" 区切りで出す。ここだけ拾ってログには流さない。
-    static const QRegularExpression progressRe(QStringLiteral(
-        R"(^Bytes\s+(Sent|Received):\s*(\d+)\s*/\s*(\d+)(?:\s+BPS:\s*(\d+))?(?:\s+ETA\s+(\d+):(\d+))?)"),
-        QRegularExpression::CaseInsensitiveOption);
-    const QRegularExpressionMatch match = progressRe.match(text);
-    if (match.hasMatch()) {
-        if (!m_transferProgress || m_transferCanceled)
-            return;
-        const qint64 done = match.captured(2).toLongLong();
-        const qint64 total = match.captured(3).toLongLong();
-        if (total > 0) {
-            const int maxValue = int(qMin<qint64>(total, std::numeric_limits<int>::max()));
-            const int value = qBound(0, int(double(done) / double(total) * maxValue), maxValue);
-            if (m_transferProgress->maximum() != maxValue)
-                m_transferProgress->setRange(0, maxValue);
-            m_transferProgress->setValue(value);
-
-            QString detail = tr("%1 / %2")
-                                 .arg(QLocale().formattedDataSize(done),
-                                      QLocale().formattedDataSize(total));
-            const QString bps = match.captured(4);
-            if (!bps.isEmpty())
-                detail += tr("  %1/s").arg(QLocale().formattedDataSize(bps.toLongLong()));
-            if (!match.captured(5).isEmpty())
-                detail += tr("  残り %1:%2").arg(match.captured(5), match.captured(6));
-            m_transferProgress->setLabelText(m_transferProgressBaseText
-                                             + QStringLiteral("\n\n") + detail);
-        }
+    if (total <= 0) {
+        if (m_transferProgress->maximum() != 0)
+            m_transferProgress->setRange(0, 0);
         return;
     }
 
-    appendLog(text);
-}
+    const int maxValue = int(qMin<qint64>(total, std::numeric_limits<int>::max()));
+    const int value = qBound(0, int(double(done) / double(total) * maxValue), maxValue);
+    if (m_transferProgress->maximum() != maxValue)
+        m_transferProgress->setRange(0, maxValue);
+    m_transferProgress->setValue(value);
 
-void MainWindow::flushTransferOutput()
-{
-    if (m_transferOutputBuffer.isEmpty())
-        return;
-    handleTransferOutputLine(QString::fromLocal8Bit(m_transferOutputBuffer));
-    m_transferOutputBuffer.clear();
+    const int percent = maxValue > 0 ? int(double(value) / double(maxValue) * 100.0) : 0;
+    m_transferProgress->setLabelText(
+        m_transferProgressBaseText
+        + QStringLiteral("\n\n%1 / %2  (%3%)")
+              .arg(QLocale().formattedDataSize(done),
+                   QLocale().formattedDataSize(total))
+              .arg(percent));
 }
 
 void MainWindow::cancelTransfer()
 {
-    if (!m_zmodem || m_transferCanceled)
+    if (!m_transfer || m_transferCanceled)
         return;
 
     m_transferCanceled = true;
-    appendLog(tr("ZMODEM 転送をキャンセルしています…"));
+    appendLog(tr("内蔵 ZMODEM 転送をキャンセルしています…"));
     if (m_transferProgress) {
         m_transferProgress->setCancelButton(nullptr);
         m_transferProgress->setLabelText(tr("キャンセルしています…"));
     }
-
-    QProcess *process = m_zmodem;
-    const qint64 pid = process->processId();
-    const bool group = m_transferGroup;
-#ifdef Q_OS_UNIX
-    if (group && pid > 0)
-        ::kill(-static_cast<pid_t>(pid), SIGTERM);
-#endif
-    process->terminate();
-    QTimer::singleShot(2000, this, [this, process, group, pid] {
-        if (m_zmodem != process)
-            return;
-#ifdef Q_OS_UNIX
-        if (group && pid > 0)
-            ::kill(-static_cast<pid_t>(pid), SIGKILL);
-#endif
-        process->kill();
-    });
+    m_transfer->cancel();
 }
 
-void MainWindow::finishTransfer(int exitCode, QProcess::ExitStatus status)
+void MainWindow::finishTransfer(bool ok, bool canceled, const QString &error)
 {
-    if (!m_zmodem)
+    if (!m_transfer)
         return;
-
-    QProcess *process = m_zmodem;
-    m_zmodem = nullptr;
-    consumeTransferOutput(process->readAllStandardOutput());
-    flushTransferOutput();
-    process->deleteLater();
+    m_transfer = nullptr;
 
     if (m_transferProgress) {
         m_transferProgress->close();
@@ -496,26 +374,25 @@ void MainWindow::finishTransfer(int exitCode, QProcess::ExitStatus status)
     m_transferProgressBaseText.clear();
 
     const bool download = m_transferDownload;
-    const bool canceled = m_transferCanceled;
     const QString refreshPath = m_transferRefreshPath;
     m_transferDownload = false;
     m_transferCanceled = false;
-    m_transferGroup = false;
     m_transferRefreshPath.clear();
-    const bool ok = (status == QProcess::NormalExit && exitCode == 0);
 
     if (canceled) {
-        appendLog(tr("ZMODEM 転送をキャンセルしました"));
+        appendLog(tr("内蔵 ZMODEM 転送をキャンセルしました"));
         statusBar()->showMessage(tr("転送をキャンセルしました"), 5000);
     } else if (ok) {
-        appendLog(download ? tr("ZMODEM ダウンロード完了") : tr("ZMODEM アップロード完了"));
-        statusBar()->showMessage(download ? tr("ダウンロードしました") : tr("アップロードしました"), 5000);
+        appendLog(download ? tr("内蔵 ZMODEM ダウンロード完了")
+                           : tr("内蔵 ZMODEM アップロード完了"));
+        statusBar()->showMessage(download ? tr("ダウンロードしました")
+                                          : tr("アップロードしました"), 5000);
     } else {
-        appendLog(tr("ZMODEM 転送失敗（終了コード %1）").arg(exitCode));
+        appendLog(tr("内蔵 ZMODEM 転送失敗: %1").arg(error));
         QMessageBox::warning(this, tr("ZMODEM"),
-                             tr("転送に失敗しました（終了コード %1）。\n\n"
+                             tr("転送に失敗しました。\n\n%1\n\n"
                                 "右ペインのリモートパスと、sgnano の転送状態を確認してください。")
-                                 .arg(exitCode));
+                                 .arg(error.isEmpty() ? tr("理由は分かりません") : error));
     }
 
     QTimer::singleShot(1500, this, [this, download, refreshPath] {
@@ -529,7 +406,7 @@ void MainWindow::finishTransfer(int exitCode, QProcess::ExitStatus status)
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
-    if (m_zmodem) {
+    if (m_transfer) {
         QMessageBox::information(this, tr("ZMODEM"), tr("転送が終わるまで終了できません。"));
         event->ignore();
         return;

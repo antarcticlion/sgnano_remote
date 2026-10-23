@@ -29,6 +29,10 @@ add_executable(sgnano_remote
     src/seriallink.cpp
     src/seriallink.h
     src/transfermime.h
+    src/zmodem.cpp
+    src/zmodem.h
+    src/zmodemworker.cpp
+    src/zmodemworker.h
 )
 
 target_link_libraries(sgnano_remote PRIVATE Qt6::Widgets)
@@ -58,4 +62,16 @@ if(BUILD_TESTING)
 
     add_test(NAME sgnano_remote_selftest COMMAND sgnano_remote_selftest)
     set_tests_properties(sgnano_remote_selftest PROPERTIES TIMEOUT 30)
+
+    add_executable(sgnano_remote_zmodem_selftest
+        tests/zmodem_selftest.cpp
+        src/zmodem.cpp
+        src/zmodem.h
+    )
+    target_link_libraries(sgnano_remote_zmodem_selftest PRIVATE Qt6::Core)
+    target_include_directories(sgnano_remote_zmodem_selftest PRIVATE src)
+    target_compile_options(sgnano_remote_zmodem_selftest PRIVATE -Wall -Wextra -Wpedantic)
+
+    add_test(NAME sgnano_remote_zmodem_selftest COMMAND sgnano_remote_zmodem_selftest)
+    set_tests_properties(sgnano_remote_zmodem_selftest PROPERTIES TIMEOUT 120)
 endif()
