@@ -170,6 +170,12 @@ QString joinRemotePath(const QString &base, const QString &name)
     return base + QLatin1Char('/') + name;
 }
 
+bool isInvalidRemoteName(const QString &name)
+{
+    return name.contains(QLatin1Char('/')) || name.contains(QLatin1Char(':'))
+        || name == QStringLiteral(".") || name == QStringLiteral("..");
+}
+
 class RemoteTreeView final : public QTreeView
 {
 public:
@@ -762,7 +768,22 @@ void RemotePane::onRequestFailed(const QString &command, int code, const QString
 
 void RemotePane::onRequestTimedOut(const QString &command)
 {
-    if (m_opsPending > 0 || m_deleteIndex < m_deletePaths.size()) {
+    const bool operationTimedOut = operationsInProgress();
+
+    emit logMessage(tr("%1 の応答がタイムアウトしました").arg(command));
+    if (command.startsWith(QStringLiteral("LIST"))) {
+        m_entries.clear();
+        m_model->removeRows(0, m_model->rowCount());
+        m_hint->setText(tr("一覧を取得できません（タイムアウト）。「更新」で再同期してください。"));
+        syncDriveCombo();
+    } else if (!operationTimedOut) {
+        m_hint->setText(tr("sgnano から応答がありません。「更新」で再同期してください。"));
+    }
+
+    m_upButton->setEnabled(false);
+    m_refreshButton->setEnabled(m_link->isOpen());
+
+    if (operationTimedOut) {
         // 時間切れは待ち行列を捨てるので、送っていない削除も含めてまとめて終わりにする
         m_opErrors.append(tr("%1: 応答がありません").arg(command));
         const int remaining = int(m_deletePaths.size()) - m_deleteIndex;
@@ -773,17 +794,6 @@ void RemotePane::onRequestTimedOut(const QString &command)
         m_deleteIndex = 0;
         finishOperations();
     }
-    emit logMessage(tr("%1 の応答がタイムアウトしました").arg(command));
-    if (command.startsWith(QStringLiteral("LIST"))) {
-        m_entries.clear();
-        m_model->removeRows(0, m_model->rowCount());
-        m_hint->setText(tr("一覧を取得できません（タイムアウト）。「更新」で再同期してください。"));
-        syncDriveCombo();
-    } else {
-        m_hint->setText(tr("sgnano から応答がありません。「更新」で再同期してください。"));
-    }
-    m_upButton->setEnabled(false);
-    m_refreshButton->setEnabled(m_link->isOpen());
 }
 
 void RemotePane::onConsoleLine(const QString &line)
@@ -818,6 +828,8 @@ void RemotePane::refreshRemote()
 {
     if (!m_link->isOpen())
         return;
+    if (!canNavigate())
+        return;
     if (!m_protocol->isSynchronized()) {
         emit logMessage(tr("sgnano と再同期しています"));
         m_protocol->sync();
@@ -831,6 +843,8 @@ void RemotePane::refreshRemote()
 
 void RemotePane::refreshRemoteAt(const QString &path)
 {
+    if (!canNavigate())
+        return;
     m_pendingRefreshPath = path;
     if (!m_link->isOpen())
         return;
@@ -844,6 +858,8 @@ void RemotePane::refreshRemoteAt(const QString &path)
 
 void RemotePane::goUpRemote()
 {
+    if (!canNavigate())
+        return;
     if (m_remotePathText.isEmpty()) {
         refreshRemote();
         return;
@@ -860,6 +876,8 @@ void RemotePane::goUpRemote()
 void RemotePane::navigateRemotePath()
 {
     if (!m_link->isOpen())
+        return;
+    if (!canNavigate())
         return;
 
     const QString path = m_remotePath->text().trimmed();
@@ -895,6 +913,8 @@ void RemotePane::openRemoteIndex(const QModelIndex &index)
 {
     if (!index.data(IsDirRole).toBool())
         return;
+    if (!canNavigate())
+        return;
 
     const QString name = index.data(NameRole).toString();
     requestList(joinRemotePath(m_remotePathText, name));
@@ -903,6 +923,8 @@ void RemotePane::openRemoteIndex(const QModelIndex &index)
 void RemotePane::onDriveActivated(int index)
 {
     if (m_updatingDrives || index < 0)
+        return;
+    if (!canNavigate())
         return;
 
     const QString letter = m_driveCombo->itemData(index).toString();
@@ -1001,6 +1023,7 @@ void RemotePane::setConnectedUi(bool connected)
 void RemotePane::updateTransferButtons()
 {
     const bool idle = m_link->isOpen() && !m_protocol->isBusy();
+    m_remotePath->setEnabled(m_link->isOpen() && !operationsInProgress());
     m_driveCombo->setEnabled(idle);
     m_refreshButton->setEnabled(idle);
     m_upButton->setEnabled(idle && !m_remotePathText.isEmpty());
@@ -1039,6 +1062,19 @@ void RemotePane::showContextMenu(const QPoint &pos)
     rn->setEnabled(m_renameButton->isEnabled());
     dl->setEnabled(m_deleteButton->isEnabled());
     menu.exec(m_tree->viewport()->mapToGlobal(pos));
+}
+
+bool RemotePane::operationsInProgress() const
+{
+    return m_opsPending > 0 || m_deleteIndex < m_deletePaths.size();
+}
+
+bool RemotePane::canNavigate()
+{
+    if (!operationsInProgress())
+        return true;
+    emit logMessage(tr("リモートの操作が終わるまで移動・更新できません"));
+    return false;
 }
 
 void RemotePane::clearOperations()
@@ -1094,9 +1130,8 @@ void RemotePane::createFolder()
                                                QLineEdit::Normal, tr("新しいフォルダ"), &ok).trimmed();
     if (!ok || name.isEmpty())
         return;
-    if (name.contains(QLatin1Char('/')) || name.contains(QLatin1Char(':')) || name == QStringLiteral(".")
-        || name == QStringLiteral("..")) {
-        QMessageBox::warning(this, tr("新しいフォルダ"), tr("名前に / や : は使えません。"));
+    if (isInvalidRemoteName(name)) {
+        QMessageBox::warning(this, tr("新しいフォルダ"), tr("名前に / や :、.、.. は使えません。"));
         return;
     }
     clearOperations();
@@ -1117,8 +1152,8 @@ void RemotePane::renameSelected()
                                                items.first().name, &ok).trimmed();
     if (!ok || name.isEmpty() || name == items.first().name)
         return;
-    if (name.contains(QLatin1Char('/')) || name.contains(QLatin1Char(':'))) {
-        QMessageBox::warning(this, tr("名前の変更"), tr("名前に / や : は使えません（同じフォルダの中でだけ変えられます）。"));
+    if (isInvalidRemoteName(name)) {
+        QMessageBox::warning(this, tr("名前の変更"), tr("名前に / や :、.、.. は使えません（同じフォルダの中でだけ変えられます）。"));
         return;
     }
     clearOperations();
@@ -1131,7 +1166,7 @@ void RemotePane::deleteSelected()
 {
     if (!m_deleteButton->isEnabled())
         return;
-    if (m_opsPending > 0 || m_deleteIndex < m_deletePaths.size())
+    if (operationsInProgress())
         return;
     const QList<SelectedItem> items = selectedItems();
     if (items.isEmpty())
@@ -1170,13 +1205,22 @@ void RemotePane::onOperationSucceeded(const QString &operation, const QString &p
 
 void RemotePane::finishOperations()
 {
-    if (m_opsPending > 0 || m_deleteIndex < m_deletePaths.size())
+    if (operationsInProgress())
         return;
 
     m_deletePaths.clear();
     m_deleteIndex = 0;
-    if (!m_remotePathText.isEmpty())
-        requestList(m_remotePathText);
+    if (m_link->isOpen()) {
+        if (!m_protocol->isSynchronized()) {
+            // 時間切れのあとは同期が切れているので、PING で戻してから一覧を読み直す
+            m_pendingRefreshPath = m_remotePathText;
+            m_hint->setText(tr("sgnano と再同期しています…"));
+            emit logMessage(tr("sgnano と再同期しています"));
+            m_protocol->sync();
+        } else if (!m_remotePathText.isEmpty()) {
+            requestList(m_remotePathText);
+        }
+    }
     if (!m_opErrors.isEmpty()) {
         const QString text = m_opErrors.join(QLatin1Char('\n'));
         m_opErrors.clear();

@@ -88,6 +88,8 @@ private:
     void syncDriveCombo();
     struct SelectedItem { QString name; bool isDir = false; };
     QList<SelectedItem> selectedItems() const;
+    bool operationsInProgress() const;
+    bool canNavigate();
     void clearOperations();
     void pumpDeleteQueue();
     void operationFinished();
