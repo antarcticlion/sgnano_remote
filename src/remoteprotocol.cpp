@@ -6,6 +6,7 @@ namespace {
 
 constexpr char kCommandMagic = '\x1e';
 constexpr int kMaxRxBuffer = 1024 * 1024;
+constexpr int kMaxQueuedRequests = 32;
 
 QByteArray unescapeField(const QByteArray &raw)
 {
@@ -275,8 +276,8 @@ void RemoteProtocol::enqueue(RequestType type, const QString &argument, const QS
         emit requestFailed(request.command, 3, tr("コマンドが長すぎます"));
         return;
     }
-    if (m_queue.size() >= 32) {
-        emit logMessage(tr("要求が多すぎるため破棄しました: %1").arg(request.command));
+    if (m_queue.size() >= kMaxQueuedRequests) {
+        emit requestFailed(request.command, 3, tr("要求が多すぎます（待ち行列がいっぱいです）"));
         return;
     }
 

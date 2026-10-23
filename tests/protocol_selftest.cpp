@@ -94,6 +94,22 @@ void offlineTests()
     check(pr.sent.size() == 2 && pr.sent.last() == QByteArray("\x1e" "DEL B:/2\n"), QStringLiteral("1 つ目が失敗しても 2 つ目を送る"));
     p.feed("@SG\tOK\tDEL\tB:/2\n");
     check(!p.isBusy(), QStringLiteral("並べた分が終わる"));
+
+    // 待ち行列がいっぱいのときは、黙って捨てずに requestFailed で返す
+    RemoteProtocol full;
+    Probe fullProbe;
+    hookProbe(full, fullProbe);
+    full.sync();
+    full.feed("@SG\tPONG\tSGNANO\r\n");
+    fullProbe.sent.clear();
+    for (int i = 0; i < 33; ++i)
+        full.requestDelete(QStringLiteral("B:/q%1").arg(i));
+    check(fullProbe.sent.size() == 1 && fullProbe.failed.isEmpty(),
+          QStringLiteral("待ち行列が埋まるまでは DEL を受け付ける"));
+    full.requestDelete(QStringLiteral("B:/q33"));
+    check(fullProbe.sent.size() == 1 && fullProbe.failed.size() == 1
+              && fullProbe.failed.last().startsWith(QStringLiteral("DEL B:/q33|3|")),
+          QStringLiteral("待ち行列がいっぱいなら requestFailed で返す"));
 }
 
 // ---- 実機あり ----

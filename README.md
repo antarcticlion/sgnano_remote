@@ -19,6 +19,6 @@ cmake -B build -G Ninja && ninja -C build
 ## 試し（2026-10-23）
 - `ctest --test-dir build --output-on-failure`: 実機なしの試しを CTest から実行する
 - `build/sgnano_remote_selftest`: 実機なし。`RemoteProtocol` に答えを流し込み、DEL / REN / MKDIR の送る行（REN はタブ区切り）、OK / ERR の受け取り、
-  断る形（空・制御文字）、待っていない OK を受け流すこと、並べた要求を 1 つずつ送ることを確かめる
+  断る形（空・制御文字・待ち行列がいっぱい）、待っていない OK を受け流すこと、並べた要求を 1 つずつ送ることを確かめる
 - `build/sgnano_remote_selftest --device /dev/ttyACM0`: 実機あり。`DRIVES` の種類で **HDD の exFAT（3）と NTFS（4）だけ**を選び（ドライブ文字はつなぐ順で変わる）、
   作る・一覧で確かめる・空白を含む名前に変える・中身のあるフォルダの削除を断られる・消す・残っていないことを通す。作ったもの（`!qt_selftest`）は消してから終わる
