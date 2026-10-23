@@ -51,6 +51,9 @@ enum RemoteRole {
     AttrRole
 };
 
+// 一括削除は一度にこの数だけ送る。RemoteProtocol の待ち行列（32）をあふれさせないため、小さめにする
+constexpr int kDeleteBatchSize = 8;
+
 class RemoteSortProxyModel final : public QSortFilterProxyModel
 {
 public:
@@ -596,6 +599,7 @@ void RemotePane::toggleConnection()
 void RemotePane::onOpened(const QString &port, int baud)
 {
     m_rxBytes = 0;
+    clearOperations();
     m_entries.clear();
     m_model->removeRows(0, m_model->rowCount());
     m_remotePathText.clear();
@@ -633,6 +637,7 @@ void RemotePane::onClosed()
 {
     ++m_openGeneration;
     m_cancelingStray = false;
+    clearOperations();
     m_protocol->reset();
     m_entries.clear();
     m_model->removeRows(0, m_model->rowCount());
@@ -747,8 +752,7 @@ void RemotePane::onRequestFailed(const QString &command, int code, const QString
     } else if (command.startsWith(QStringLiteral("DEL")) || command.startsWith(QStringLiteral("REN"))
                || command.startsWith(QStringLiteral("MKDIR"))) {
         m_opErrors.append(tr("%1: %2").arg(command.section(QLatin1Char(' '), 1).replace(QLatin1Char('\t'), QStringLiteral(" → ")), message));
-        if (m_opsPending > 0 && --m_opsPending == 0)
-            finishOperations();
+        operationFinished();
     } else if (command.startsWith(QStringLiteral("CWD"))) {
         m_hint->setText(tr("現在のフォルダを取得できません: %1").arg(message));
     } else if (command.startsWith(QStringLiteral("DRIVES"))) {
@@ -758,9 +762,15 @@ void RemotePane::onRequestFailed(const QString &command, int code, const QString
 
 void RemotePane::onRequestTimedOut(const QString &command)
 {
-    if (m_opsPending > 0) {      // 時間切れは待ち行列を捨てるので、残りの操作もまとめて終わりにする
+    if (m_opsPending > 0 || m_deleteIndex < m_deletePaths.size()) {
+        // 時間切れは待ち行列を捨てるので、送っていない削除も含めてまとめて終わりにする
         m_opErrors.append(tr("%1: 応答がありません").arg(command));
+        const int remaining = int(m_deletePaths.size()) - m_deleteIndex;
+        if (remaining > 0)
+            m_opErrors.append(tr("残り %1 件の削除は中止しました").arg(remaining));
         m_opsPending = 0;
+        m_deletePaths.clear();
+        m_deleteIndex = 0;
         finishOperations();
     }
     emit logMessage(tr("%1 の応答がタイムアウトしました").arg(command));
@@ -1031,6 +1041,49 @@ void RemotePane::showContextMenu(const QPoint &pos)
     menu.exec(m_tree->viewport()->mapToGlobal(pos));
 }
 
+void RemotePane::clearOperations()
+{
+    m_opsPending = 0;
+    m_deletePaths.clear();
+    m_deleteIndex = 0;
+    m_opErrors.clear();
+    m_sendingDeleteBatch = false;
+}
+
+void RemotePane::pumpDeleteQueue()
+{
+    if (m_sendingDeleteBatch)
+        return;
+
+    // 返事を待たずに詰め込むと RemoteProtocol の待ち行列（32）があふれるので、少しずつ送る
+    m_sendingDeleteBatch = true;
+    while (m_deleteIndex < m_deletePaths.size() && m_opsPending < kDeleteBatchSize) {
+        const QString path = m_deletePaths.at(m_deleteIndex++);
+        ++m_opsPending;
+        emit logMessage(tr("消します: %1").arg(path));
+        m_protocol->requestDelete(path);
+    }
+    m_sendingDeleteBatch = false;
+
+    if (m_opsPending == 0 && m_deleteIndex >= m_deletePaths.size())
+        finishOperations();
+}
+
+void RemotePane::operationFinished()
+{
+    if (m_opsPending > 0)
+        --m_opsPending;
+    if (m_opsPending > 0)
+        return;
+    if (m_deleteIndex < m_deletePaths.size()) {
+        pumpDeleteQueue();
+        return;
+    }
+    // pumpDeleteQueue の中から呼ばれたときは、あちらでまとめて終わりにする
+    if (!m_sendingDeleteBatch)
+        finishOperations();
+}
+
 void RemotePane::createFolder()
 {
     if (!m_mkdirButton->isEnabled())
@@ -1046,7 +1099,7 @@ void RemotePane::createFolder()
         QMessageBox::warning(this, tr("新しいフォルダ"), tr("名前に / や : は使えません。"));
         return;
     }
-    m_opErrors.clear();
+    clearOperations();
     m_opsPending = 1;
     emit logMessage(tr("フォルダを作ります: %1").arg(joinRemotePath(m_remotePathText, name)));
     m_protocol->requestMkdir(joinRemotePath(m_remotePathText, name));
@@ -1068,7 +1121,7 @@ void RemotePane::renameSelected()
         QMessageBox::warning(this, tr("名前の変更"), tr("名前に / や : は使えません（同じフォルダの中でだけ変えられます）。"));
         return;
     }
-    m_opErrors.clear();
+    clearOperations();
     m_opsPending = 1;
     emit logMessage(tr("名前を変えます: %1 → %2").arg(items.first().name, name));
     m_protocol->requestRename(joinRemotePath(m_remotePathText, items.first().name), name);
@@ -1077,6 +1130,8 @@ void RemotePane::renameSelected()
 void RemotePane::deleteSelected()
 {
     if (!m_deleteButton->isEnabled())
+        return;
+    if (m_opsPending > 0 || m_deleteIndex < m_deletePaths.size())
         return;
     const QList<SelectedItem> items = selectedItems();
     if (items.isEmpty())
@@ -1095,12 +1150,13 @@ void RemotePane::deleteSelected()
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (answer != QMessageBox::Yes)
         return;
-    m_opErrors.clear();
-    m_opsPending = int(items.size());
-    for (const SelectedItem &it : items) {
-        emit logMessage(tr("消します: %1").arg(joinRemotePath(m_remotePathText, it.name)));
-        m_protocol->requestDelete(joinRemotePath(m_remotePathText, it.name));
-    }
+    clearOperations();
+    m_deletePaths.reserve(items.size());
+    for (const SelectedItem &it : items)
+        m_deletePaths.append(joinRemotePath(m_remotePathText, it.name));
+    if (m_deletePaths.size() > kDeleteBatchSize)
+        emit logMessage(tr("%1 項目を %2 件ずつ消します").arg(m_deletePaths.size()).arg(kDeleteBatchSize));
+    pumpDeleteQueue();
 }
 
 void RemotePane::onOperationSucceeded(const QString &operation, const QString &path)
@@ -1109,12 +1165,16 @@ void RemotePane::onOperationSucceeded(const QString &operation, const QString &p
                                               : operation == QStringLiteral("REN") ? tr("名前を変更")
                                                                                      : tr("フォルダを作成"),
                                               path));
-    if (m_opsPending > 0 && --m_opsPending == 0)
-        finishOperations();
+    operationFinished();
 }
 
 void RemotePane::finishOperations()
 {
+    if (m_opsPending > 0 || m_deleteIndex < m_deletePaths.size())
+        return;
+
+    m_deletePaths.clear();
+    m_deleteIndex = 0;
     if (!m_remotePathText.isEmpty())
         requestList(m_remotePathText);
     if (!m_opErrors.isEmpty()) {

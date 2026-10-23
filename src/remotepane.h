@@ -88,6 +88,9 @@ private:
     void syncDriveCombo();
     struct SelectedItem { QString name; bool isDir = false; };
     QList<SelectedItem> selectedItems() const;
+    void clearOperations();
+    void pumpDeleteQueue();
+    void operationFinished();
     void finishOperations();
 
     SerialLink *m_link = nullptr;
@@ -121,6 +124,9 @@ private:
     bool m_cancelingStray = false;
     quint64 m_openGeneration = 0;
     quint64 m_rxBytes = 0;
-    int m_opsPending = 0;           // 返事を待っている DEL / REN / MKDIR の数（0 になったら一覧を読み直す）
+    int m_opsPending = 0;           // 送信済みで返事を待っている DEL / REN / MKDIR の数
     QStringList m_opErrors;         // そのまとまりの失敗（終わったらまとめて出す）
+    QStringList m_deletePaths;      // 一括削除でこれから送るパス（m_deleteIndex から少しずつ送る）
+    int m_deleteIndex = 0;
+    bool m_sendingDeleteBatch = false;
 };
