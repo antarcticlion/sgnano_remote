@@ -1,5 +1,6 @@
 #include "remotepane.h"
 
+#include "remotedeletequeue.h"
 #include "seriallink.h"
 #include "transfermime.h"
 
@@ -50,9 +51,6 @@ enum RemoteRole {
     MtimeRole,
     AttrRole
 };
-
-// 一括削除は一度にこの数だけ送る。RemoteProtocol の待ち行列（32）をあふれさせないため、小さめにする
-constexpr int kDeleteBatchSize = 8;
 
 class RemoteSortProxyModel final : public QSortFilterProxyModel
 {
@@ -283,6 +281,7 @@ RemotePane::RemotePane(QWidget *parent)
     : QWidget(parent)
     , m_link(new SerialLink(this))
     , m_protocol(new RemoteProtocol(this))
+    , m_deleteQueue(new RemoteDeleteQueue(this))
 {
     buildUi();
 
@@ -308,6 +307,13 @@ RemotePane::RemotePane(QWidget *parent)
     connect(m_protocol, &RemoteProtocol::consoleLine, this, &RemotePane::onConsoleLine);
     connect(m_protocol, &RemoteProtocol::busyChanged, this, &RemotePane::onBusyChanged);
     connect(m_protocol, &RemoteProtocol::logMessage, this, &RemotePane::logMessage);
+
+    connect(m_deleteQueue, &RemoteDeleteQueue::deleteRequested, this, [this](const QString &path) {
+        ++m_opsPending;
+        emit logMessage(tr("消します: %1").arg(path));
+        m_protocol->requestDelete(path);
+    });
+    connect(m_deleteQueue, &RemoteDeleteQueue::finished, this, &RemotePane::finishOperations);
 
     refreshPorts();
     loadSettings();
@@ -786,12 +792,11 @@ void RemotePane::onRequestTimedOut(const QString &command)
     if (operationTimedOut) {
         // 時間切れは待ち行列を捨てるので、送っていない削除も含めてまとめて終わりにする
         m_opErrors.append(tr("%1: 応答がありません").arg(command));
-        const int remaining = int(m_deletePaths.size()) - m_deleteIndex;
+        const int remaining = m_deleteQueue->remaining();
         if (remaining > 0)
             m_opErrors.append(tr("残り %1 件の削除は中止しました").arg(remaining));
         m_opsPending = 0;
-        m_deletePaths.clear();
-        m_deleteIndex = 0;
+        m_deleteQueue->abortRemaining();
         finishOperations();
     }
 }
@@ -1066,7 +1071,7 @@ void RemotePane::showContextMenu(const QPoint &pos)
 
 bool RemotePane::operationsInProgress() const
 {
-    return m_opsPending > 0 || m_deleteIndex < m_deletePaths.size();
+    return m_opsPending > 0 || m_deleteQueue->hasRemaining();
 }
 
 bool RemotePane::canNavigate()
@@ -1080,43 +1085,20 @@ bool RemotePane::canNavigate()
 void RemotePane::clearOperations()
 {
     m_opsPending = 0;
-    m_deletePaths.clear();
-    m_deleteIndex = 0;
+    m_deleteQueue->reset();
     m_opErrors.clear();
-    m_sendingDeleteBatch = false;
-}
-
-void RemotePane::pumpDeleteQueue()
-{
-    if (m_sendingDeleteBatch)
-        return;
-
-    // 返事を待たずに詰め込むと RemoteProtocol の待ち行列（32）があふれるので、少しずつ送る
-    m_sendingDeleteBatch = true;
-    while (m_deleteIndex < m_deletePaths.size() && m_opsPending < kDeleteBatchSize) {
-        const QString path = m_deletePaths.at(m_deleteIndex++);
-        ++m_opsPending;
-        emit logMessage(tr("消します: %1").arg(path));
-        m_protocol->requestDelete(path);
-    }
-    m_sendingDeleteBatch = false;
-
-    if (m_opsPending == 0 && m_deleteIndex >= m_deletePaths.size())
-        finishOperations();
 }
 
 void RemotePane::operationFinished()
 {
     if (m_opsPending > 0)
         --m_opsPending;
-    if (m_opsPending > 0)
-        return;
-    if (m_deleteIndex < m_deletePaths.size()) {
-        pumpDeleteQueue();
+    if (m_deleteQueue->isActive()) {
+        // 一括削除の途中なら、次の 8 件を送るか、全部終わったら finished が来る
+        m_deleteQueue->operationFinished();
         return;
     }
-    // pumpDeleteQueue の中から呼ばれたときは、あちらでまとめて終わりにする
-    if (!m_sendingDeleteBatch)
+    if (m_opsPending == 0)
         finishOperations();
 }
 
@@ -1186,12 +1168,13 @@ void RemotePane::deleteSelected()
     if (answer != QMessageBox::Yes)
         return;
     clearOperations();
-    m_deletePaths.reserve(items.size());
+    QStringList paths;
+    paths.reserve(items.size());
     for (const SelectedItem &it : items)
-        m_deletePaths.append(joinRemotePath(m_remotePathText, it.name));
-    if (m_deletePaths.size() > kDeleteBatchSize)
-        emit logMessage(tr("%1 項目を %2 件ずつ消します").arg(m_deletePaths.size()).arg(kDeleteBatchSize));
-    pumpDeleteQueue();
+        paths.append(joinRemotePath(m_remotePathText, it.name));
+    if (paths.size() > RemoteDeleteQueue::kBatchSize)
+        emit logMessage(tr("%1 項目を %2 件ずつ消します").arg(paths.size()).arg(RemoteDeleteQueue::kBatchSize));
+    m_deleteQueue->start(paths);
 }
 
 void RemotePane::onOperationSucceeded(const QString &operation, const QString &path)
@@ -1208,8 +1191,7 @@ void RemotePane::finishOperations()
     if (operationsInProgress())
         return;
 
-    m_deletePaths.clear();
-    m_deleteIndex = 0;
+    m_deleteQueue->reset();
     if (m_link->isOpen()) {
         if (!m_protocol->isSynchronized()) {
             // 時間切れのあとは同期が切れているので、PING で戻してから一覧を読み直す

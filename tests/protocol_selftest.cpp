@@ -1,7 +1,10 @@
 // sgnano_remote の試し（2026-10-23）。
-//   sgnano_remote_selftest                      … 実機なし: RemoteProtocol に答えを流し込み、DEL / REN / MKDIR の送る行と OK / ERR の受け取りを確かめる
+//   sgnano_remote_selftest                      … 実機なし: RemoteProtocol に答えを流し込み、DEL / REN / MKDIR の送る行と OK / ERR の受け取りを確かめる。
+//                                                  RemoteDeleteQueue の 8 件ずつの送信・途中失敗・タイムアウトも確かめる
 //   sgnano_remote_selftest --device /dev/ttyACM0 … 実機あり: DRIVES の種類で HDD の exFAT（3）と NTFS（4）を選び、作る・名前を変える・消すを通す。
 //                                                  作ったものは消してから終わる。FAT（1）には書かない（ドライブ文字はつなぐ順で変わるので、種類で選ぶ）
+//   sgnano_remote_selftest --device-many /dev/ttyACM0 … 実機あり: 34 個のフォルダを 8 件ずつ消せることを確かめる
+#include "remotedeletequeue.h"
 #include "remoteprotocol.h"
 #include "seriallink.h"
 
@@ -112,6 +115,198 @@ void offlineTests()
           QStringLiteral("待ち行列がいっぱいなら requestFailed で返す"));
 }
 
+// ---- 一括削除の順番（RemotePane から切り出した RemoteDeleteQueue） ----
+void deleteQueueTests()
+{
+    // 34 件を 8 件ずつ送り、最後の 2 件まで完走する
+    {
+        RemoteDeleteQueue q;
+        QStringList sent;
+        int finished = 0;
+        QObject::connect(&q, &RemoteDeleteQueue::deleteRequested,
+                         [&sent](const QString &p) { sent.append(p); });
+        QObject::connect(&q, &RemoteDeleteQueue::finished, [&finished] { ++finished; });
+
+        QStringList paths;
+        for (int i = 0; i < 34; ++i)
+            paths.append(QStringLiteral("B:/d%1").arg(i, 2, 10, QLatin1Char('0')));
+
+        q.start(paths);
+        check(sent.size() == 8 && q.pending() == 8 && q.remaining() == 26 && q.isActive(),
+              QStringLiteral("一括削除は最初に 8 件だけ送る"));
+
+        for (int i = 0; i < 7; ++i)
+            q.operationFinished();
+        check(sent.size() == 8 && q.pending() == 1 && finished == 0,
+              QStringLiteral("7 件の返事では次の 8 件を送らない"));
+
+        q.operationFinished();
+        check(sent.size() == 16 && q.pending() == 8 && q.remaining() == 18,
+              QStringLiteral("8 件終わったら次の 8 件を送る"));
+
+        for (int i = 0; i < 8; ++i)
+            q.operationFinished();
+        check(sent.size() == 24 && q.pending() == 8 && q.remaining() == 10,
+              QStringLiteral("3 回目の 8 件"));
+
+        for (int i = 0; i < 8; ++i)
+            q.operationFinished();
+        check(sent.size() == 32 && q.pending() == 8 && q.remaining() == 2,
+              QStringLiteral("4 回目の 8 件"));
+
+        for (int i = 0; i < 8; ++i)
+            q.operationFinished();
+        check(sent.size() == 34 && q.pending() == 2 && q.remaining() == 0 && q.isActive(),
+              QStringLiteral("34 件目まで送る（最後は 2 件）"));
+
+        q.operationFinished();
+        check(q.isActive() && q.pending() == 1 && finished == 0,
+              QStringLiteral("最後の 2 件のうち 1 件では終わらない"));
+
+        q.operationFinished();
+        check(!q.isActive() && q.pending() == 0 && finished == 1,
+              QStringLiteral("34 件の一括削除が終わる"));
+
+        q.operationFinished();
+        check(finished == 1, QStringLiteral("終わったあとの余分な返事では finished を出さない"));
+    }
+
+    // 途中で 1 件失敗しても、残りの返事がそろえば次の 8 件へ進む
+    {
+        RemoteDeleteQueue q;
+        QStringList sent;
+        int finished = 0;
+        QObject::connect(&q, &RemoteDeleteQueue::deleteRequested,
+                         [&sent](const QString &p) { sent.append(p); });
+        QObject::connect(&q, &RemoteDeleteQueue::finished, [&finished] { ++finished; });
+
+        QStringList paths;
+        for (int i = 0; i < 10; ++i)
+            paths.append(QStringLiteral("B:/e%1").arg(i));
+
+        q.start(paths);
+        check(sent.size() == 8 && q.pending() == 8, QStringLiteral("途中失敗の試し: 最初の 8 件"));
+        q.operationFinished();   // 1 件目が ERR だったことにする
+        check(sent.size() == 8 && q.pending() == 7 && q.remaining() == 2,
+              QStringLiteral("1 件失敗しても、まだ次の 8 件は送らない"));
+
+        for (int i = 0; i < 7; ++i)
+            q.operationFinished();
+        check(sent.size() == 10 && q.pending() == 2 && q.remaining() == 0,
+              QStringLiteral("8 件分の返事がそろったら残り 2 件を送る"));
+
+        q.operationFinished();
+        q.operationFinished();
+        check(!q.isActive() && finished == 1, QStringLiteral("途中失敗があっても一括削除は完走する"));
+    }
+
+    // タイムアウト: 送っていない分をやめ、それ以上送らない
+    {
+        RemoteDeleteQueue q;
+        QStringList sent;
+        int finished = 0;
+        QObject::connect(&q, &RemoteDeleteQueue::deleteRequested,
+                         [&sent](const QString &p) { sent.append(p); });
+        QObject::connect(&q, &RemoteDeleteQueue::finished, [&finished] { ++finished; });
+
+        QStringList paths;
+        for (int i = 0; i < 20; ++i)
+            paths.append(QStringLiteral("B:/f%1").arg(i));
+
+        q.start(paths);
+        check(sent.size() == 8 && q.remaining() == 12, QStringLiteral("タイムアウトの試し: 最初の 8 件"));
+        const int remaining = q.remaining();
+        q.abortRemaining();
+        check(remaining == 12 && !q.isActive() && !q.hasRemaining() && q.pending() == 0 && finished == 0,
+              QStringLiteral("タイムアウトで残りを中止する"));
+
+        for (int i = 0; i < 20; ++i)
+            q.operationFinished();
+        check(sent.size() == 8 && finished == 0, QStringLiteral("中止したあとは送らない"));
+    }
+
+    // 返事が同期的に返る場合（待ち行列がいっぱいで即座に失敗する場合など）も、再入で崩れない
+    {
+        RemoteDeleteQueue q;
+        QStringList sent;
+        int finished = 0;
+        QObject::connect(&q, &RemoteDeleteQueue::deleteRequested, [&q, &sent](const QString &p) {
+            sent.append(p);
+            q.operationFinished();
+        });
+        QObject::connect(&q, &RemoteDeleteQueue::finished, [&finished] { ++finished; });
+
+        QStringList paths;
+        for (int i = 0; i < 34; ++i)
+            paths.append(QStringLiteral("B:/g%1").arg(i));
+
+        q.start(paths);
+        check(sent.size() == 34 && finished == 1 && !q.isActive() && q.pending() == 0,
+              QStringLiteral("同期的な返事でも 34 件を送り切る"));
+    }
+
+    // start し直すと前の並びは捨てる
+    {
+        RemoteDeleteQueue q;
+        QStringList sent;
+        QObject::connect(&q, &RemoteDeleteQueue::deleteRequested,
+                         [&sent](const QString &p) { sent.append(p); });
+
+        q.start({ QStringLiteral("B:/old1"), QStringLiteral("B:/old2") });
+        q.start({ QStringLiteral("B:/new") });
+        check(sent.size() == 3 && sent.last() == QStringLiteral("B:/new") && q.total() == 1 && q.pending() == 1,
+              QStringLiteral("start し直すと前の並びを捨てる"));
+    }
+
+    // RemoteProtocol と組んだ通しの試し: 34 件のうち 1 件だけ ERR でも、残りを送り切る
+    {
+        RemoteProtocol p;
+        Probe pr;
+        hookProbe(p, pr);
+        p.sync();
+        p.feed("@SG\tPONG\tSGNANO\r\n");
+        pr.sent.clear();
+
+        RemoteDeleteQueue q;
+        int finished = 0;
+        QObject::connect(&q, &RemoteDeleteQueue::deleteRequested,
+                         [&p](const QString &path) { p.requestDelete(path); });
+        QObject::connect(&p, &RemoteProtocol::operationSucceeded,
+                         [&q](const QString &, const QString &) { q.operationFinished(); });
+        QObject::connect(&p, &RemoteProtocol::requestFailed,
+                         [&q](const QString &, int, const QString &) { q.operationFinished(); });
+        QObject::connect(&q, &RemoteDeleteQueue::finished, [&finished] { ++finished; });
+
+        QStringList paths;
+        for (int i = 0; i < 34; ++i)
+            paths.append(QStringLiteral("B:/h%1").arg(i));
+
+        q.start(paths);
+        check(pr.sent.size() == 1, QStringLiteral("通しの試し: 最初は 1 つだけ送る"));
+
+        int fed = 0;
+        while (q.isActive() && fed < 100) {
+            if (pr.sent.isEmpty())
+                break;
+            ++fed;
+            QByteArray command = pr.sent.last();
+            command.remove(0, 1);   // 頭の 0x1E
+            if (command.endsWith('\n'))
+                command.chop(1);
+            const QString path = QString::fromUtf8(command).mid(4);   // "DEL " の後ろ
+            if (fed == 11)
+                p.feed("@SG\tERR\t1\tNo such file or directory\n");
+            else
+                p.feed(QStringLiteral("@SG\tOK\tDEL\t%1\r\n").arg(path).toUtf8());
+        }
+
+        check(finished == 1 && !q.isActive() && !p.isBusy() && fed == 34,
+              QStringLiteral("通しの試し: 34 件を送り切る"));
+        check(pr.sent.size() == 34 && pr.ok.size() == 33 && pr.failed.size() == 1,
+              QStringLiteral("通しの試し: 1 件の ERR があっても残りを送る"));
+    }
+}
+
 // ---- 実機あり ----
 class Device
 {
@@ -151,6 +346,17 @@ public:
         waitIdle(ms);
         return lastErr == 0;
     }
+    bool listNames(const QString &dir, QStringList *names)
+    {
+        entries.clear();
+        const bool ok = run([&] { proto.requestList(dir); }, 15000);
+        if (names) {
+            names->clear();
+            for (const RemoteEntry &e : entries)
+                names->append(e.name);
+        }
+        return ok;
+    }
     bool listHas(const QString &dir, const QString &name, bool *isDir = nullptr)
     {
         entries.clear();
@@ -158,6 +364,26 @@ public:
         for (const RemoteEntry &e : entries)
             if (e.name == name) { if (isDir) *isDir = e.isDir; return true; }
         return false;
+    }
+    // 空のフォルダを消す。前の回の残りを片付けるときだけ使う（深さは 8 まで）
+    bool removeTree(const QString &dir, int depth = 0)
+    {
+        if (depth > 8)
+            return false;
+        entries.clear();
+        if (!run([&] { proto.requestList(dir); }, 15000))
+            return false;
+        const QList<RemoteEntry> children = entries;
+        for (const RemoteEntry &e : children) {
+            const QString child = dir + QLatin1Char('/') + e.name;
+            if (e.isDir) {
+                if (!removeTree(child, depth + 1))
+                    return false;
+            } else if (!run([&] { proto.requestDelete(child); })) {
+                return false;
+            }
+        }
+        return run([&] { proto.requestDelete(dir); });
     }
 
     SerialLink link;
@@ -208,6 +434,112 @@ void deviceTests(const QString &port)
     d.link.close();
 }
 
+// 実機で 34 個のフォルダを 8 件ずつ消す（34 件以上でも RemoteDeleteQueue が詰まらないことの確認）
+void deviceManyTests(const QString &port)
+{
+    constexpr int kCount = 34;
+    Device d;
+    check(d.open(port), QStringLiteral("実機と同期する（%1）").arg(port));
+    if (g_fail) return;
+    d.run([&] { d.proto.requestDrives(); });
+    QString letters;
+    for (const RemoteDrive &r : d.drives) letters += QStringLiteral("%1=%2 ").arg(r.letter).arg(r.type);
+    std::printf("    drives: %s\n", qPrintable(letters));
+
+    for (int type : { 3, 4 }) {
+        QString drv;
+        int n = 0;
+        for (const RemoteDrive &r : d.drives) if (r.type == type && r.ready) { drv = r.letter; ++n; }
+        const QString label = type == 3 ? QStringLiteral("exFAT") : QStringLiteral("NTFS");
+        if (n != 1) { check(false, QStringLiteral("%1 の区画がちょうど 1 つある（%2 個）").arg(label).arg(n)); continue; }
+
+        const QString root = drv + QStringLiteral(":/");
+        const QString baseName = QStringLiteral("!qt_selftest_many");
+        const QString base = root + baseName;
+        std::printf("  -- %s %s\n", qPrintable(label), qPrintable(root));
+
+        if (d.listHas(root, baseName)) {   // 前の回の残り
+            check(d.removeTree(base), QStringLiteral("%1: 前の回の残りを片付ける").arg(label));
+            d.waitIdle(5000);
+        }
+
+        if (!d.run([&] { d.proto.requestMkdir(base); })) {
+            check(false, QStringLiteral("%1: 台のフォルダを作る（%2）").arg(label, d.lastErrText));
+            continue;
+        }
+
+        QStringList paths;
+        bool created = true;
+        for (int i = 0; i < kCount; ++i) {
+            const QString path = base + QStringLiteral("/d%1").arg(i, 2, 10, QLatin1Char('0'));
+            if (!d.run([&] { d.proto.requestMkdir(path); })) { created = false; break; }
+            paths.append(path);
+        }
+        check(created && paths.size() == kCount,
+              QStringLiteral("%1: %2 個のフォルダを作る（%3 個）").arg(label).arg(kCount).arg(paths.size()));
+
+        QStringList names;
+        check(d.listNames(base, &names) && names.size() == kCount,
+              QStringLiteral("%1: %2 個そろっている（%3 個）").arg(label).arg(kCount).arg(names.size()));
+        if (!created || paths.size() != kCount) {
+            d.removeTree(base);
+            continue;
+        }
+
+        RemoteDeleteQueue q;
+        QEventLoop loop;
+        int ok = 0;
+        int err = 0;
+        int timeouts = 0;
+        bool queueFinished = false;
+        const auto c1 = QObject::connect(&q, &RemoteDeleteQueue::deleteRequested,
+                                         [&d](const QString &path) { d.proto.requestDelete(path); });
+        const auto c2 = QObject::connect(&d.proto, &RemoteProtocol::operationSucceeded,
+                                         [&q, &ok](const QString &, const QString &) {
+                                             ++ok;
+                                             q.operationFinished();
+                                         });
+        const auto c3 = QObject::connect(&d.proto, &RemoteProtocol::requestFailed,
+                                         [&q, &err](const QString &, int, const QString &) {
+                                             ++err;
+                                             q.operationFinished();
+                                         });
+        const auto c4 = QObject::connect(&d.proto, &RemoteProtocol::requestTimedOut,
+                                         [&q, &timeouts, &loop](const QString &) {
+                                             ++timeouts;
+                                             q.abortRemaining();
+                                             loop.quit();
+                                         });
+        const auto c5 = QObject::connect(&q, &RemoteDeleteQueue::finished, [&queueFinished, &loop] {
+            queueFinished = true;
+            loop.quit();
+        });
+        QTimer::singleShot(300000, &loop, &QEventLoop::quit);
+
+        q.start(paths);
+        loop.exec();
+        QObject::disconnect(c1);
+        QObject::disconnect(c2);
+        QObject::disconnect(c3);
+        QObject::disconnect(c4);
+        QObject::disconnect(c5);
+
+        check(queueFinished && ok == kCount && err == 0 && timeouts == 0,
+              QStringLiteral("%1: %2 件を 8 件ずつ消せる（OK %3 / ERR %4 / タイムアウト %5）")
+                  .arg(label).arg(kCount).arg(ok).arg(err).arg(timeouts));
+        if (!queueFinished || err > 0 || timeouts > 0) {
+            q.abortRemaining();
+            d.waitIdle(5000);
+        }
+
+        names.clear();
+        check(d.listNames(base, &names) && names.isEmpty(),
+              QStringLiteral("%1: %2 件とも残っていない（%3 個）").arg(label).arg(kCount).arg(names.size()));
+        check(d.run([&] { d.proto.requestDelete(base); }), QStringLiteral("%1: 台のフォルダを消す").arg(label));
+    }
+    d.link.close();
+}
+
 }
 
 int main(int argc, char **argv)
@@ -215,6 +547,10 @@ int main(int argc, char **argv)
     QCoreApplication app(argc, argv);
     const QStringList args = app.arguments();
     offlineTests();
+    deleteQueueTests();
+    const int many = int(args.indexOf(QStringLiteral("--device-many")));
+    if (many > 0 && many + 1 < args.size())
+        deviceManyTests(args.at(many + 1));
     const int at = int(args.indexOf(QStringLiteral("--device")));
     if (at > 0 && at + 1 < args.size())
         deviceTests(args.at(at + 1));

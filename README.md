@@ -8,7 +8,7 @@ sgnano の UART の遠隔コマンド（`@SG` で答える行、sgnano の `src/
 - アップロード・ダウンロード（ボタン、ドラッグ・アンド・ドロップ）
 - **新しいフォルダ・名前の変更（F2）・削除（Delete、確かめる。複数可。フォルダは空のときだけ）**（2026-10-23。sgnano の `MKDIR` / `REN` / `DEL`）。
   ボタンと右クリックのメニュー。終わったら一覧を読み直し、できなかった操作はまとめて知らせる。
-  多数の削除は 8 件ずつ順に送る（`RemoteProtocol` の待ち行列をあふれさせない）。
+  多数の削除は `RemoteDeleteQueue` で 8 件ずつ順に送る（`RemoteProtocol` の待ち行列をあふれさせない）。
   削除などの操作中は、移動・更新・パス入力を受け付けない
 
 ## ビルド
@@ -19,6 +19,9 @@ cmake -B build -G Ninja && ninja -C build
 ## 試し（2026-10-23）
 - `ctest --test-dir build --output-on-failure`: 実機なしの試しを CTest から実行する
 - `build/sgnano_remote_selftest`: 実機なし。`RemoteProtocol` に答えを流し込み、DEL / REN / MKDIR の送る行（REN はタブ区切り）、OK / ERR の受け取り、
-  断る形（空・制御文字・待ち行列がいっぱい）、待っていない OK を受け流すこと、並べた要求を 1 つずつ送ることを確かめる
+  断る形（空・制御文字・待ち行列がいっぱい）、待っていない OK を受け流すこと、並べた要求を 1 つずつ送ることを確かめる。
+  `RemoteDeleteQueue` の 8 件ずつの送信、34 件以上の完走、途中失敗、タイムアウト、同期的な返事も確かめる
 - `build/sgnano_remote_selftest --device /dev/ttyACM0`: 実機あり。`DRIVES` の種類で **HDD の exFAT（3）と NTFS（4）だけ**を選び（ドライブ文字はつなぐ順で変わる）、
   作る・一覧で確かめる・空白を含む名前に変える・中身のあるフォルダの削除を断られる・消す・残っていないことを通す。作ったもの（`!qt_selftest`）は消してから終わる
+- `build/sgnano_remote_selftest --device-many /dev/ttyACM0`: 実機あり。同じく exFAT / NTFS に 34 個のフォルダを作り、`RemoteDeleteQueue` で 8 件ずつ消して、
+  全部残らず消えたことを確かめる。作ったもの（`!qt_selftest_many`）は消してから終わる

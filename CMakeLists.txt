@@ -20,6 +20,8 @@ add_executable(sgnano_remote
     src/localpane.h
     src/remotepane.cpp
     src/remotepane.h
+    src/remotedeletequeue.cpp
+    src/remotedeletequeue.h
     src/remoteprotocol.cpp
     src/remoteprotocol.h
     src/seriallink.cpp
@@ -39,6 +41,8 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(sgnano_remote_selftest
         tests/protocol_selftest.cpp
+        src/remotedeletequeue.cpp
+        src/remotedeletequeue.h
         src/remoteprotocol.cpp
         src/remoteprotocol.h
         src/seriallink.cpp
