@@ -101,11 +101,15 @@ void MainWindow::buildUi()
             m_remotePane->toggleConnection();
     });
 
-    auto *refreshAction = remoteMenu->addAction(tr("更新(&R)"));
-    refreshAction->setShortcut(QKeySequence::Refresh);
-    connect(refreshAction, &QAction::triggered, this, [this] {
-        m_localPane->refresh();
-        m_remotePane->refreshRemote();
+    auto *refreshLocalAction = remoteMenu->addAction(tr("ファイル一覧更新(ホスト)(&H)"));
+    refreshLocalAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_R));
+    connect(refreshLocalAction, &QAction::triggered, m_localPane, &LocalPane::refresh);
+
+    auto *refreshRemoteAction = remoteMenu->addAction(tr("ファイル一覧更新(リモート)(&R)"));
+    refreshRemoteAction->setShortcut(QKeySequence::Refresh);
+    connect(refreshRemoteAction, &QAction::triggered, this, [this] {
+        if (!m_transfer)
+            m_remotePane->refreshRemote();
     });
 
     auto *upAction = remoteMenu->addAction(tr("リモートで上へ(&U)"));

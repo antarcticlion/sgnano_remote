@@ -16,6 +16,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocale>
+#include <QMenu>
 #include <QMimeData>
 #include <QSortFilterProxyModel>
 #include <QStandardPaths>
@@ -159,6 +160,11 @@ LocalPane::LocalPane(QWidget *parent)
     homeButton->setToolTip(tr("ホームフォルダへ移動"));
     homeButton->setAutoRaise(false);
 
+    m_refreshButton = new QToolButton(this);
+    m_refreshButton->setText(tr("更新"));
+    m_refreshButton->setToolTip(tr("現在のフォルダを読み直す"));
+    m_refreshButton->setAutoRaise(false);
+
     m_pathEdit = new QLineEdit(this);
     m_pathEdit->setClearButtonEnabled(true);
     m_pathEdit->setPlaceholderText(tr("パスを入力して Enter"));
@@ -171,6 +177,7 @@ LocalPane::LocalPane(QWidget *parent)
     header->addStretch(1);
     header->addWidget(upButton);
     header->addWidget(homeButton);
+    header->addWidget(m_refreshButton);
 
     auto *pathRow = new QHBoxLayout;
     pathRow->setContentsMargins(0, 0, 0, 0);
@@ -208,6 +215,12 @@ LocalPane::LocalPane(QWidget *parent)
     m_view->setDefaultDropAction(Qt::CopyAction);
     m_view->setDropIndicatorShown(false);
     m_view->setToolTip(tr("リモートのファイルをここへドロップすると、このフォルダへダウンロードします"));
+    m_view->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_view, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
+        QMenu menu(this);
+        menu.addAction(tr("更新"), this, &LocalPane::refresh);
+        menu.exec(m_view->viewport()->mapToGlobal(pos));
+    });
     m_view->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_view->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_view->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
@@ -233,6 +246,7 @@ LocalPane::LocalPane(QWidget *parent)
 
     connect(upButton, &QToolButton::clicked, this, &LocalPane::goUp);
     connect(homeButton, &QToolButton::clicked, this, &LocalPane::goHome);
+    connect(m_refreshButton, &QToolButton::clicked, this, &LocalPane::refresh);
     connect(m_pathEdit, &QLineEdit::returnPressed, this, &LocalPane::navigateToPath);
     connect(m_view, &QTreeView::activated, this, &LocalPane::openIndex);
     connect(m_model, &QFileSystemModel::directoryLoaded, this, [this](const QString &path) {
@@ -276,9 +290,25 @@ QStringList LocalPane::selectedFiles() const
 
 void LocalPane::refresh()
 {
+    const QFileInfo info(m_currentPath);
+    if (!info.exists() || !info.isDir()) {
+        setCurrentDir(QStandardPaths::writableLocation(QStandardPaths::HomeLocation));
+        return;
+    }
+
+    const QString root = m_model->rootPath();
+    m_model->setRootPath(QString());
+    m_model->setRootPath(root.isEmpty() ? QDir::rootPath() : root);
+
     const QModelIndex source = m_model->index(m_currentPath);
-    if (source.isValid())
-        m_view->setRootIndex(m_proxy->mapFromSource(source));
+    if (source.isValid()) {
+        const QModelIndex proxy = m_proxy->mapFromSource(source);
+        if (proxy.isValid()) {
+            if (m_proxy->canFetchMore(proxy))
+                m_proxy->fetchMore(proxy);
+            m_view->setRootIndex(proxy);
+        }
+    }
     refreshSummary();
 }
 

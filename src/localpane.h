@@ -7,6 +7,7 @@ class QFileSystemModel;
 class QLabel;
 class QLineEdit;
 class QSortFilterProxyModel;
+class QToolButton;
 class QTreeView;
 
 class LocalPane : public QWidget
@@ -18,6 +19,8 @@ public:
 
     QString currentPath() const;
     QStringList selectedFiles() const;
+
+public slots:
     void refresh();
 
 signals:
@@ -38,6 +41,7 @@ private:
     QSortFilterProxyModel *m_proxy = nullptr;
     QTreeView *m_view = nullptr;
     QLineEdit *m_pathEdit = nullptr;
+    QToolButton *m_refreshButton = nullptr;
     QLabel *m_summary = nullptr;
     QString m_currentPath;
 };
