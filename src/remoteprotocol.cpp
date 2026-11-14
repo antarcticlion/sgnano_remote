@@ -7,6 +7,8 @@ namespace {
 constexpr char kCommandMagic = '\x1e';
 constexpr int kMaxRxBuffer = 1024 * 1024;
 constexpr int kMaxQueuedRequests = 32;
+// sgnano の uartcon.h（2026-11-14）: 頭の 0x1E と改行を除いた 1 行が 320 バイトまで
+constexpr int kMaxCommandBytes = 320;
 
 QByteArray unescapeField(const QByteArray &raw)
 {
@@ -204,6 +206,26 @@ void RemoteProtocol::requestMkdir(const QString &path)
     enqueue(RequestType::Mkdir, path);
 }
 
+void RemoteProtocol::requestCopy(const QString &source, const QString &target)
+{
+    enqueue(RequestType::Copy, source, target);
+}
+
+void RemoteProtocol::requestJoin(const QString &path)
+{
+    enqueue(RequestType::Join, path);
+}
+
+void RemoteProtocol::requestSplit(const QString &path, quint32 partSize)
+{
+    enqueue(RequestType::Split, path, partSize ? QString::number(partSize) : QString());
+}
+
+void RemoteProtocol::requestSysFsck(bool repair)
+{
+    enqueue(RequestType::SysFsck, repair ? QStringLiteral("REPAIR") : QString());
+}
+
 namespace {
 
 bool hasControl(const QString &s)
@@ -270,9 +292,49 @@ void RemoteProtocol::enqueue(RequestType type, const QString &argument, const QS
         }
         request.command = QStringLiteral("REN ") + argument + QLatin1Char('\t') + argument2;
         break;
+    case RequestType::Copy:
+        // COPY 元<TAB>先（先はファイルのパス。同名は置き換える）
+        if (argument.trimmed().isEmpty() || argument2.trimmed().isEmpty()
+            || hasControl(argument) || hasControl(argument2)) {
+            emit requestFailed(QStringLiteral("COPY"), 2, tr("パスが空か、制御文字が含まれています"));
+            return;
+        }
+        request.command = QStringLiteral("COPY ") + argument + QLatin1Char('\t') + argument2;
+        break;
+    case RequestType::Join:
+        if (argument.trimmed().isEmpty() || hasControl(argument)) {
+            emit requestFailed(QStringLiteral("JOIN"), 2, tr("パスが空か、制御文字が含まれています"));
+            return;
+        }
+        request.command = QStringLiteral("JOIN ") + argument;
+        break;
+    case RequestType::Split: {
+        if (argument.trimmed().isEmpty() || hasControl(argument)) {
+            emit requestFailed(QStringLiteral("SPLIT"), 2, tr("パスが空か、制御文字が含まれています"));
+            return;
+        }
+        bool sizeOk = true;
+        const quint32 partSize = argument2.isEmpty() ? 0 : argument2.toUInt(&sizeOk);
+        if (!sizeOk || (partSize != 0 && (partSize < 512 || partSize % 512 != 0))) {
+            emit requestFailed(QStringLiteral("SPLIT"), 2, tr("分ける大きさは 512 の倍数で指定してください"));
+            return;
+        }
+        request.command = QStringLiteral("SPLIT ") + argument;
+        if (partSize)
+            request.command += QLatin1Char('\t') + QString::number(partSize);
+        break;
+    }
+    case RequestType::SysFsck:
+        if (argument != QStringLiteral("REPAIR") && !argument.isEmpty()) {
+            emit requestFailed(QStringLiteral("SYSFSCK"), 2, tr("SYSFSCK の引数が正しくありません"));
+            return;
+        }
+        request.command = argument.isEmpty() ? QStringLiteral("SYSFSCK")
+                                             : QStringLiteral("SYSFSCK REPAIR");
+        break;
     }
 
-    if (request.command.toUtf8().size() >= 312) {
+    if (request.command.toUtf8().size() >= kMaxCommandBytes) {
         emit requestFailed(request.command, 3, tr("コマンドが長すぎます"));
         return;
     }
@@ -317,6 +379,12 @@ void RemoteProtocol::pump()
     else if (m_current.type == RequestType::Delete || m_current.type == RequestType::Rename
              || m_current.type == RequestType::Mkdir)
         timeout = 35000;    // 実機は 1 回の操作を最長 30 秒待つ（NTFS・大きいフォルダ）
+    else if (m_current.type == RequestType::Copy)
+        timeout = 600000;   // 14MB の写しでも数分かかりうる
+    else if (m_current.type == RequestType::Join || m_current.type == RequestType::Split)
+        timeout = 600000;   // 10MB の結合が実機で約 21 秒。64 個（2 MB ずつで 128MB）まで見る
+    else if (m_current.type == RequestType::SysFsck)
+        timeout = 120000;
 
     emit busyChanged(true);
     m_timeout->start(timeout);
@@ -528,6 +596,11 @@ void RemoteProtocol::handleFields(const QList<QByteArray> &fields)
         return;
     }
 
+    if (kind == "SYSFSCK") {
+        handleFsck(fields);
+        return;
+    }
+
     if (kind == "ERR") {
         handleError(fields);
         return;
@@ -552,6 +625,11 @@ void RemoteProtocol::handleDrive(const QList<QByteArray> &fields)
     drive.letter = QString::fromLatin1(fields.at(2));
     drive.type = fields.at(3).toInt();
     drive.ready = fields.at(4).toInt() != 0;
+    // 2026-11-08 の本体からは、USB の台（msc）と区画の先頭（plba）も返す。古い本体でも動くよう、無ければ 0 のまま
+    if (fields.size() >= 6)
+        drive.msc = fields.at(5).toInt();
+    if (fields.size() >= 7)
+        parseU64(fields.at(6), &drive.plba);
     m_drives.append(drive);
 }
 
@@ -608,19 +686,66 @@ void RemoteProtocol::handleStat(const QList<QByteArray> &fields)
     completeCurrent();
 }
 
+void RemoteProtocol::handleFsck(const QList<QByteArray> &fields)
+{
+    if (!m_hasCurrent || m_current.type != RequestType::SysFsck || fields.size() < 3) {
+        emit logMessage(tr("予期しない SYSFSCK 応答を受信しました"));
+        return;
+    }
+
+    RemoteFsckResult result;
+    result.repair = fields.at(2) == "REPAIR";
+    for (int i = 3; i < fields.size(); ++i) {
+        const QByteArray &field = fields.at(i);
+        const int equals = field.indexOf('=');
+        if (equals <= 0)
+            continue;
+        bool ok = false;
+        const quint64 value = field.mid(equals + 1).toULongLong(&ok);
+        if (!ok)
+            continue;
+        const QByteArray key = field.left(equals);
+        if (key == "files")
+            result.files = quint32(value);
+        else if (key == "dirs")
+            result.dirs = quint32(value);
+        else if (key == "size_fixed")
+            result.sizeFixed = quint32(value);
+        else if (key == "freed")
+            result.freed = quint32(value);
+        else if (key == "cross")
+            result.cross = quint32(value);
+        else if (key == "bad")
+            result.bad = quint32(value);
+        else if (key == "fat2")
+            result.fat2Fixed = quint32(value);
+    }
+
+    emit fsckFinished(result);
+    completeCurrent();
+}
+
 void RemoteProtocol::handleOk(const QList<QByteArray> &fields)
 {
     const bool expected = m_hasCurrent
         && (m_current.type == RequestType::Delete || m_current.type == RequestType::Rename
-            || m_current.type == RequestType::Mkdir);
+            || m_current.type == RequestType::Mkdir || m_current.type == RequestType::Copy
+            || m_current.type == RequestType::Join || m_current.type == RequestType::Split);
     if (!expected || fields.size() < 4) {
         emit logMessage(tr("予期しない OK 応答を受信しました: %1").arg(QString::fromUtf8(fields.join('\t'))));
         return;
     }
     const QString op = QString::fromLatin1(fields.at(2));
-    const QString want = m_current.type == RequestType::Delete ? QStringLiteral("DEL")
-                       : m_current.type == RequestType::Rename ? QStringLiteral("REN")
-                                                                : QStringLiteral("MKDIR");
+    QString want;
+    switch (m_current.type) {
+    case RequestType::Delete: want = QStringLiteral("DEL"); break;
+    case RequestType::Rename: want = QStringLiteral("REN"); break;
+    case RequestType::Mkdir: want = QStringLiteral("MKDIR"); break;
+    case RequestType::Copy: want = QStringLiteral("COPY"); break;
+    case RequestType::Join: want = QStringLiteral("JOIN"); break;
+    case RequestType::Split: want = QStringLiteral("SPLIT"); break;
+    default: break;
+    }
     if (op != want) {
         emit logMessage(tr("予期しない OK 応答を受信しました: %1").arg(QString::fromUtf8(fields.join('\t'))));
         return;

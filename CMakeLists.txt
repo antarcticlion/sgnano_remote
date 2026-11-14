@@ -29,6 +29,8 @@ add_executable(sgnano_remote
     src/seriallink.cpp
     src/seriallink.h
     src/transfermime.h
+    src/uploadsplit.cpp
+    src/uploadsplit.h
     src/zmodem.cpp
     src/zmodem.h
     src/zmodemworker.cpp
@@ -55,6 +57,12 @@ if(BUILD_TESTING)
         src/remoteprotocol.h
         src/seriallink.cpp
         src/seriallink.h
+        src/uploadsplit.cpp
+        src/uploadsplit.h
+        src/zmodem.cpp
+        src/zmodem.h
+        src/zmodemworker.cpp
+        src/zmodemworker.h
     )
     target_link_libraries(sgnano_remote_selftest PRIVATE Qt6::Core)
     target_include_directories(sgnano_remote_selftest PRIVATE src)
@@ -74,4 +82,17 @@ if(BUILD_TESTING)
 
     add_test(NAME sgnano_remote_zmodem_selftest COMMAND sgnano_remote_zmodem_selftest)
     set_tests_properties(sgnano_remote_zmodem_selftest PROPERTIES TIMEOUT 120)
+
+    # 試し（2026-11-14）: 4 MB を越えるファイルを name.001 .. に分ける（本体の JOIN は 64 個まで）
+    add_executable(sgnano_remote_uploadsplit_selftest
+        tests/uploadsplit_selftest.cpp
+        src/uploadsplit.cpp
+        src/uploadsplit.h
+    )
+    target_link_libraries(sgnano_remote_uploadsplit_selftest PRIVATE Qt6::Core)
+    target_include_directories(sgnano_remote_uploadsplit_selftest PRIVATE src)
+    target_compile_options(sgnano_remote_uploadsplit_selftest PRIVATE -Wall -Wextra -Wpedantic)
+
+    add_test(NAME sgnano_remote_uploadsplit_selftest COMMAND sgnano_remote_uploadsplit_selftest)
+    set_tests_properties(sgnano_remote_uploadsplit_selftest PROPERTIES TIMEOUT 60)
 endif()

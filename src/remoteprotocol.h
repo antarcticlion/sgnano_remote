@@ -12,14 +12,29 @@ struct RemoteDrive
     QString letter;
     int type = 0;
     bool ready = false;
+    int msc = -1;           // 2026-11-08 の DRIVES から足えた欄（USB ストレージの台と区画の先頭）
+    quint64 plba = 0;
 
-    // sgnano 本体（2026-10-24）では S: は内蔵フラッシュのシステムのドライブに決まっている。
+    // sgnano 本体（2026-10-24、2026-11-02 に 4 MB へ）では S: は内蔵フラッシュのシステムのドライブに決まっている。
     // USB のドライブは A から順に S を飛ばすので、文字だけで見分けられる。
     bool isSystem() const
     {
         return letter.size() == 1
             && (letter.at(0) == QLatin1Char('S') || letter.at(0) == QLatin1Char('s'));
     }
+};
+
+// SYSFSCK（2026-11-12）の戻り。S: の FAT12 を検査・修復した数。
+struct RemoteFsckResult
+{
+    bool repair = false;
+    quint32 files = 0;
+    quint32 dirs = 0;
+    quint32 sizeFixed = 0;
+    quint32 freed = 0;
+    quint32 cross = 0;
+    quint32 bad = 0;
+    quint32 fat2Fixed = 0;
 };
 
 struct RemoteEntry
@@ -62,6 +77,11 @@ public slots:
     void requestDelete(const QString &path);
     void requestRename(const QString &path, const QString &newName);
     void requestMkdir(const QString &path);
+    // 2026-11-14 の sgnano に合わせて足したもの（COPY は 2026-10-24、JOIN/SPLIT は 2026-10-24、SYSFSCK は 2026-11-12）
+    void requestCopy(const QString &source, const QString &target);
+    void requestJoin(const QString &path);                    // path は .001
+    void requestSplit(const QString &path, quint32 partSize = 0);   // 0 なら本体の既定（4 MB）
+    void requestSysFsck(bool repair);
 
 signals:
     void transmit(const QByteArray &data);
@@ -72,7 +92,8 @@ signals:
     void entryReceived(const RemoteEntry &entry);
     void listFinished(int count, bool truncated);
     void statReceived(const RemoteStat &stat);
-    void operationSucceeded(const QString &operation, const QString &path);   // operation = DEL / REN / MKDIR、path は実機が返した結果のパス
+    void operationSucceeded(const QString &operation, const QString &path);   // operation = DEL / REN / MKDIR / COPY / JOIN / SPLIT、path は実機が返した結果のパス
+    void fsckFinished(const RemoteFsckResult &result);
     void requestFailed(const QString &command, int code, const QString &message);
     void requestTimedOut(const QString &command);
     void consoleLine(const QString &line);
@@ -88,7 +109,11 @@ private:
         Stat,
         Delete,
         Rename,
-        Mkdir
+        Mkdir,
+        Copy,
+        Join,
+        Split,
+        SysFsck
     };
 
     struct Request
@@ -110,6 +135,7 @@ private:
     void handleDrive(const QList<QByteArray> &fields);
     void handleListEntry(const QList<QByteArray> &fields);
     void handleStat(const QList<QByteArray> &fields);
+    void handleFsck(const QList<QByteArray> &fields);
     void handleError(const QList<QByteArray> &fields);
     void handleOk(const QList<QByteArray> &fields);
     void finishList(int count, bool truncated);

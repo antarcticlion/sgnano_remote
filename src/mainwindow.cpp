@@ -1,12 +1,15 @@
 #include "mainwindow.h"
 
 #include "localpane.h"
+#include "remotefs.h"
 #include "remotepane.h"
+#include "uploadsplit.h"
 #include "zmodemworker.h"
 
 #include <QAction>
 #include <QCloseEvent>
 #include <QDockWidget>
+#include <QFileInfo>
 #include <QFontDatabase>
 #include <QIcon>
 #include <QKeySequence>
@@ -213,13 +216,28 @@ void MainWindow::startUploadTo(const QStringList &files, const QString &remoteDi
                                  tr("いまは転送や一覧の読み込み中です。"));
         return;
     }
+    if (!RemoteFs::isWritableDriveType(m_remotePane->currentDriveType())) {
+        QMessageBox::warning(this, tr("アップロード"), tr("このドライブには書けません。"));
+        return;
+    }
+
+    bool hasLarge = false;
+    for (const QString &file : files) {
+        if (QFileInfo(file).size() > qint64(UploadSplit::kDeviceFileMax)) {
+            hasLarge = true;
+            break;
+        }
+    }
+    const QString largeNote = hasLarge
+        ? tr("\n\n4 MB を越えるファイルは分割して送り、実機で結合します（64 MB 以下は 1 MB ずつ）。")
+        : QString();
 
     const QMessageBox::StandardButton answer = QMessageBox::warning(
         this, tr("ZMODEM アップロード"),
         tr("選択した %1 個のファイルを\n%2\nへ送ります。\n\n"
-           "同名ファイルは上書きされます。実行しますか？")
+           "同名ファイルは上書きされます。%3実行しますか？")
             .arg(files.size())
-            .arg(remoteDir),
+            .arg(remoteDir, largeNote),
         QMessageBox::Ok | QMessageBox::Cancel);
     if (answer != QMessageBox::Ok)
         return;

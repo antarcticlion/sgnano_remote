@@ -28,6 +28,12 @@ bool isSystemDrivePath(const QString &path)
         && path.at(1) == QLatin1Char(':');
 }
 
+bool isWritableDriveType(int type)
+{
+    // sgnano の src/filer/filer.h の FDRV_*（1 = FAT、2 = FAT(FD)、3 = exFAT、4 = NTFS）
+    return type == 1 || type == 2 || type == 3 || type == 4;
+}
+
 bool isProtectedSystemPath(const QString &path)
 {
     if (!isSystemDrivePath(path))

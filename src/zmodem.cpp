@@ -64,7 +64,8 @@ constexpr int kMaxFileTries = 10;
 constexpr int kMaxDataTries = 10;
 constexpr int kMaxWakeTries = 20;
 
-// sgnano 本体（src/filer/fzm.c）の受け取りの上限。これより大きいファイルは ZSKIP で断られる
+// sgnano 本体（src/filer/fzm.c）の受け取りの上限。これより大きいファイルは ZSKIP で断られる。
+// 4 MB を越えるファイルは ZmodemWorker が name.001 .. に分けて送り、本体の JOIN でつなぐ（2026-11-14）
 constexpr quint32 kDeviceFileMax = 4u * 1024u * 1024u;
 // 本体が受け取る名前の大きさ（同 fzm.c の char name[132]）
 constexpr int kDeviceNameMax = 131;

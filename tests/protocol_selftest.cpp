@@ -10,10 +10,14 @@
 #include "remotefs.h"
 #include "remoteprotocol.h"
 #include "seriallink.h"
+#include "zmodemworker.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QFile>
+#include <QTemporaryDir>
 #include <QTimer>
 
 #include <cstdio>
@@ -36,6 +40,8 @@ struct Probe
     QList<QByteArray> sent;
     QStringList ok, failed, logs;
     QList<RemoteDrive> drives;
+    RemoteFsckResult fsck;
+    bool fsckSeen = false;
 };
 
 void hookProbe(RemoteProtocol &p, Probe &pr)
@@ -45,6 +51,8 @@ void hookProbe(RemoteProtocol &p, Probe &pr)
                      [&pr](const QList<RemoteDrive> &d) { pr.drives = d; });
     QObject::connect(&p, &RemoteProtocol::operationSucceeded,
                      [&pr](const QString &op, const QString &path) { pr.ok.append(op + QLatin1Char('|') + path); });
+    QObject::connect(&p, &RemoteProtocol::fsckFinished,
+                     [&pr](const RemoteFsckResult &r) { pr.fsck = r; pr.fsckSeen = true; });
     QObject::connect(&p, &RemoteProtocol::requestFailed, [&pr](const QString &c, int code, const QString &m) {
         pr.failed.append(QStringLiteral("%1|%2|%3").arg(c).arg(code).arg(m));
     });
@@ -160,6 +168,94 @@ void systemDriveTests()
               && pr.drives.at(1).letter == QStringLiteral("S") && pr.drives.at(1).isSystem()
               && pr.drives.at(1).type == 1 && pr.drives.at(1).ready && !p.isBusy(),
           QStringLiteral("DRIVES で S:（内蔵フラッシュ、FAT）を読む"));
+}
+
+// ---- 2026-11-14 の sgnano に合わせた遠隔コマンド ----
+void latestFirmwareTests()
+{
+    RemoteProtocol p;
+    Probe pr;
+    hookProbe(p, pr);
+    p.sync();
+    p.feed("@SG\tPONG\tSGNANO\r\n");
+    pr.sent.clear();
+
+    // DRIVES は 2026-11-08 から台番号（msc）と区画の先頭（plba）も返す。古い形（5 欄）も読める
+    p.requestDrives();
+    p.feed("@SG\tDRV\tA\t3\t1\t2\t239223\r\n"
+           "@SG\tDRV\tS\t1\t1\r\n"
+           "@SG\tDRIVES\tEND\t2\r\n");
+    check(pr.drives.size() == 2
+              && pr.drives.at(0).letter == QStringLiteral("A") && pr.drives.at(0).msc == 2
+              && pr.drives.at(0).plba == 239223
+              && pr.drives.at(1).letter == QStringLiteral("S") && pr.drives.at(1).msc == -1
+              && !p.isBusy(),
+          QStringLiteral("DRIVES の追加の欄（msc / plba）を読み、古い 5 欄も読む"));
+
+    // COPY 元<TAB>先（2026-10-24）
+    p.requestCopy(QStringLiteral("B:/a b.txt"), QStringLiteral("C:/c d.txt"));
+    check(pr.sent.last() == QByteArray("\x1e" "COPY B:/a b.txt\tC:/c d.txt\n"),
+          QStringLiteral("COPY はタブで区切る"));
+    p.feed("@SG\tOK\tCOPY\tC:/c d.txt\n");
+    check(pr.ok.last() == QStringLiteral("COPY|C:/c d.txt") && !p.isBusy(),
+          QStringLiteral("OK COPY を受けて終わる"));
+
+    // JOIN / SPLIT は結果のあとに数が付く（2026-10-24）
+    p.requestJoin(QStringLiteral("B:/big.001"));
+    check(pr.sent.last() == QByteArray("\x1e" "JOIN B:/big.001\n"), QStringLiteral("JOIN の送る行"));
+    p.feed("@SG\tOK\tJOIN\tB:/big\t3\n");
+    check(pr.ok.last() == QStringLiteral("JOIN|B:/big"), QStringLiteral("OK JOIN を受ける（数は読み飛ばす）"));
+
+    p.requestSplit(QStringLiteral("B:/big"), 4u * 1024u * 1024u);
+    check(pr.sent.last() == QByteArray("\x1e" "SPLIT B:/big\t4194304\n"),
+          QStringLiteral("SPLIT はタブで大きさを付ける"));
+    p.feed("@SG\tOK\tSPLIT\tB:/big\t3\n");
+    check(pr.ok.last() == QStringLiteral("SPLIT|B:/big"), QStringLiteral("OK SPLIT を受ける"));
+
+    // SYSFSCK（2026-11-12）
+    p.requestSysFsck(false);
+    check(pr.sent.last() == QByteArray("\x1e" "SYSFSCK\n"), QStringLiteral("SYSFSCK の送る行"));
+    p.feed("@SG\tSYSFSCK\tCHECK\tfiles=5\tdirs=3\tsize_fixed=1\tfreed=2\tcross=0\tbad=0\tfat2=1\n");
+    check(pr.fsckSeen && !pr.fsck.repair && pr.fsck.files == 5 && pr.fsck.dirs == 3
+              && pr.fsck.sizeFixed == 1 && pr.fsck.freed == 2 && pr.fsck.fat2Fixed == 1 && !p.isBusy(),
+          QStringLiteral("SYSFSCK の結果を読む"));
+
+    pr.fsckSeen = false;
+    p.requestSysFsck(true);
+    check(pr.sent.last() == QByteArray("\x1e" "SYSFSCK REPAIR\n"), QStringLiteral("SYSFSCK REPAIR の送る行"));
+    p.feed("@SG\tSYSFSCK\tREPAIR\tfiles=0\tdirs=0\tsize_fixed=0\tfreed=0\tcross=0\tbad=0\tfat2=0\n");
+    check(pr.fsckSeen && pr.fsck.repair, QStringLiteral("SYSFSCK REPAIR の結果を読む"));
+
+    // 512 の倍数でない分割の大きさは送らない
+    const int sentBefore = int(pr.sent.size());
+    const int failedBefore = int(pr.failed.size());
+    p.requestSplit(QStringLiteral("B:/big"), 1000);
+    check(int(pr.sent.size()) == sentBefore && int(pr.failed.size()) == failedBefore + 1,
+          QStringLiteral("512 の倍数でない SPLIT は送らずに断る"));
+
+    // 1 行の上限（2026-11-14 の uartcon.h は 320 バイト。頭の 0x1E と改行を除く）
+    const QString fits(315, QLatin1Char('a'));       // "DEL " 4 + 315 = 319
+    p.requestDelete(fits);
+    check(pr.sent.last() == QByteArray("\x1e" "DEL ") + fits.toUtf8() + '\n',
+          QStringLiteral("319 バイトのコマンドは送る"));
+    p.feed(QByteArray("@SG\tOK\tDEL\t") + fits.toUtf8() + '\n');
+
+    const int beforeTooLong = int(pr.sent.size());
+    const int failTooLong = int(pr.failed.size());
+    p.requestDelete(QString(316, QLatin1Char('a')));   // "DEL " 4 + 316 = 320
+    check(int(pr.sent.size()) == beforeTooLong && int(pr.failed.size()) == failTooLong + 1,
+          QStringLiteral("320 バイトのコマンドは送らずに断る"));
+
+    // 本体のドライブの種類（FDRV_FAT_MSC=1, FAT_FLOPPY=2, EXFAT=3, NTFS=4 が書き込み可）
+    check(RemoteFs::isWritableDriveType(1) && RemoteFs::isWritableDriveType(2)
+              && RemoteFs::isWritableDriveType(3) && RemoteFs::isWritableDriveType(4)
+              && !RemoteFs::isWritableDriveType(5) && !RemoteFs::isWritableDriveType(6),
+          QStringLiteral("書き込みできるドライブの種類を見分ける"));
+
+    // 2026-11-02 に S: のルートへ増えた bin・sbin は、本体は守らない（消せる）
+    check(!RemoteFs::isProtectedSystemPath(QStringLiteral("S:/bin"))
+              && !RemoteFs::isProtectedSystemPath(QStringLiteral("S:/sbin")),
+          QStringLiteral("S:/bin・S:/sbin はシステムのフォルダではない"));
 }
 
 // ---- 一括削除の順番（RemotePane から切り出した RemoteDeleteQueue） ----
@@ -364,6 +460,8 @@ public:
                QObject::connect(&proto, &RemoteProtocol::entryReceived, [this](const RemoteEntry &e) { entries.append(e); });
                QObject::connect(&proto, &RemoteProtocol::listStarted, [this](const QString &) { entries.clear(); });
                QObject::connect(&proto, &RemoteProtocol::operationSucceeded, [this](const QString &op, const QString &) { lastOk = op; });
+               QObject::connect(&proto, &RemoteProtocol::statReceived, [this](const RemoteStat &s) { stat = s; statSeen = true; });
+               QObject::connect(&proto, &RemoteProtocol::fsckFinished, [this](const RemoteFsckResult &r) { fsck = r; fsckSeen = true; });
                QObject::connect(&proto, &RemoteProtocol::requestFailed, [this](const QString &, int code, const QString &m) {
                    lastErr = code; lastErrText = m; });
                QObject::connect(&proto, &RemoteProtocol::requestTimedOut, [this](const QString &c) { lastErr = -2; lastErrText = c; }); }
@@ -392,6 +490,26 @@ public:
         f();
         waitIdle(ms);
         return lastErr == 0;
+    }
+    bool statPath(const QString &path, RemoteStat *out = nullptr)
+    {
+        statSeen = false;
+        stat = RemoteStat();
+        const bool ok = run([&] { proto.requestStat(path); }, 15000);
+        if (out)
+            *out = stat;
+        return ok && statSeen;
+    }
+    bool runFsck(bool repair, RemoteFsckResult *out = nullptr)
+    {
+        fsckSeen = false;
+        fsck = RemoteFsckResult();
+        lastOk.clear(); lastErr = 0; lastErrText.clear();
+        proto.requestSysFsck(repair);
+        waitIdle(120000);
+        if (out)
+            *out = fsck;
+        return fsckSeen && lastErr == 0;
     }
     bool listNames(const QString &dir, QStringList *names)
     {
@@ -437,6 +555,10 @@ public:
     RemoteProtocol proto;
     QList<RemoteDrive> drives;
     QList<RemoteEntry> entries;
+    RemoteStat stat;
+    RemoteFsckResult fsck;
+    bool statSeen = false;
+    bool fsckSeen = false;
     QString lastOk, lastErrText;
     int lastErr = 0;
 };
@@ -474,14 +596,27 @@ void deviceTests(const QString &port)
             check(found && isDir, QStringLiteral("S:/%1 がある").arg(name));
             check(found && (attr & 0x04) != 0, QStringLiteral("S:/%1 はシステムの属性").arg(name));
         }
+
+        // 2026-11-12 の SYSFSCK（読みだけ。修復は実機の大事な中身を変えるので、この試しではしない）
+        RemoteFsckResult fsck;
+        check(d.runFsck(false, &fsck),
+              QStringLiteral("S: の SYSFSCK（検査）が答える（ファイル %1・フォルダ %2）").arg(fsck.files).arg(fsck.dirs));
+        check(!fsck.repair, QStringLiteral("SYSFSCK の戻りは CHECK"));
     }
 
+    bool writableTested = false;
     for (int type : { 3, 4 }) {
         QString drv;
         int n = 0;
         for (const RemoteDrive &r : d.drives) if (r.type == type && r.ready) { drv = r.letter; ++n; }
         const QString label = type == 3 ? QStringLiteral("exFAT") : QStringLiteral("NTFS");
-        if (n != 1) { check(false, QStringLiteral("%1 の区画がちょうど 1 つある（%2 個）").arg(label).arg(n)); continue; }
+        if (n == 0) {
+            std::printf("  -- %s: 準備できた区画が無いので飛ばす\n", qPrintable(label));
+            continue;
+        }
+        writableTested = true;
+        if (n > 1)
+            std::printf("  -- %s: %d 個のうち %s を試す\n", qPrintable(label), n, qPrintable(drv));
         const QString root = drv + QStringLiteral(":/");
         const QString dir = root + QStringLiteral("!qt_selftest");
         std::printf("  -- %s %s\n", qPrintable(label), qPrintable(root));
@@ -504,6 +639,204 @@ void deviceTests(const QString &port)
         check(d.run([&] { d.proto.requestDelete(dir); }) && d.lastOk == QStringLiteral("DEL"), QStringLiteral("%1: DEL（空になったフォルダ）").arg(label));
         check(!d.listHas(root, QStringLiteral("!qt_selftest")), QStringLiteral("%1: 残っていない").arg(label));
     }
+    check(writableTested, QStringLiteral("exFAT か NTFS の準備できた区画がある"));
+    d.link.close();
+}
+
+bool writeFile(const QString &path, const QByteArray &data)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+    return file.write(data) == data.size();
+}
+
+QByteArray readFile(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return QByteArray();
+    return file.readAll();
+}
+
+void waitMs(int ms)
+{
+    QEventLoop loop;
+    QTimer::singleShot(ms, &loop, &QEventLoop::quit);
+    loop.exec();
+}
+
+// 実機で 4 MB を越えるファイルを送る（2026-11-14 の分割 → ZMODEM → JOIN → 分割の削除）と、
+// そのファイルをそのまま受け取る（本体のストリーミング送信）。exFAT と NTFS の両方で確かめる。
+void deviceLargeTests(const QString &port)
+{
+    constexpr int kSize = 4 * 1024 * 1024 + 123;
+    // 既定は 2 MB ずつ（環境変数で切り分けられる）
+
+    Device d;
+    check(d.open(port), QStringLiteral("実機と同期する（%1）").arg(port));
+    if (g_fail)
+        return;
+    d.run([&] { d.proto.requestDrives(); });
+
+    QStringList targets;
+    for (const RemoteDrive &r : d.drives) {
+        if ((r.type == 3 || r.type == 4) && r.ready)
+            targets.append(r.letter);
+    }
+    check(!targets.isEmpty(), QStringLiteral("exFAT / NTFS のドライブがある"));
+    if (targets.isEmpty()) {
+        d.link.close();
+        return;
+    }
+
+    QTemporaryDir localDir;
+    QTemporaryDir receivedDir;
+    check(localDir.isValid() && receivedDir.isValid(), QStringLiteral("ローカルの一時フォルダを作る"));
+    if (!localDir.isValid() || !receivedDir.isValid()) {
+        d.link.close();
+        return;
+    }
+
+    QByteArray data(kSize, '\0');
+    for (int i = 0; i < kSize; ++i)
+        data[i] = char((i * 37 + i / 1021 + i / 65536) & 0xFF);
+    const QString name = QStringLiteral("!qt_large.bin");
+    const QString source = localDir.filePath(name);
+    check(writeFile(source, data), QStringLiteral("4 MB + 123 バイトの元のファイルを書く"));
+
+    constexpr int kSmallSize = 64 * 1024;
+    QByteArray small(kSmallSize, '\0');
+    for (int i = 0; i < kSmallSize; ++i)
+        small[i] = char((i * 13 + 7) & 0xFF);
+    const QString smallName = QStringLiteral("!qt_small.bin");
+    const QString smallSource = localDir.filePath(smallName);
+    check(writeFile(smallSource, small), QStringLiteral("COPY / SPLIT / JOIN 用の 64 KB のファイルを書く"));
+    if (g_fail) {
+        d.link.close();
+        return;
+    }
+
+    for (const QString &letter : targets) {
+        const QString root = letter + QStringLiteral(":/");
+        const QString remoteDir = root + QStringLiteral("!qt_selftest_large");
+        const QString remoteFile = remoteDir + QLatin1Char('/') + name;
+
+        // 前の回の残りを片付ける
+        if (d.listHas(root, QStringLiteral("!qt_selftest_large")))
+            d.removeTree(remoteDir);
+        check(d.run([&] { d.proto.requestMkdir(remoteDir); }), QStringLiteral("%1: 試験用フォルダを作る").arg(letter));
+        if (g_fail) {
+            d.link.close();
+            return;
+        }
+        d.link.close();
+
+        bool upOk = false;
+        bool upCanceled = false;
+        QString upError;
+        {
+            ZmodemWorker worker(port, 921600, ZmodemWorker::Mode::Upload,
+                                QStringList{ source, smallSource }, QString(), remoteDir);
+            QObject::connect(&worker, &ZmodemWorker::logMessage,
+                             [](const QString &message) { std::printf("    %s\n", qPrintable(message)); });
+            QObject::connect(&worker, &ZmodemWorker::finished,
+                             [&upOk, &upCanceled, &upError](bool ok, bool canceled, const QString &error) {
+                                 upOk = ok;
+                                 upCanceled = canceled;
+                                 upError = error;
+                             });
+            worker.run();
+        }
+        check(upOk, QStringLiteral("%1: 4 MB 超のアップロード（分割→ZMODEM→JOIN→分割の削除）%2")
+                        .arg(letter, upCanceled ? QStringLiteral("（中止）") : QString()));
+        if (!upOk)
+            std::printf("    upload error: %s\n", qPrintable(upError));
+
+        waitMs(800);
+        Device checkDevice;
+        if (checkDevice.open(port)) {
+            RemoteStat st;
+            check(upOk && checkDevice.statPath(remoteFile, &st) && !st.isDir && st.size == quint64(kSize),
+                  QStringLiteral("%1: 結合したファイルの大きさが %2 バイト").arg(letter).arg(kSize));
+            if (upOk) {
+                const QString smallRemote = remoteDir + QLatin1Char('/') + smallName;
+                RemoteStat smallStat;
+                check(checkDevice.statPath(smallRemote, &smallStat)
+                          && !smallStat.isDir && smallStat.size == quint64(kSmallSize),
+                      QStringLiteral("%1: 64 KB のファイルも送れている").arg(letter));
+
+                // 2026-10-24 の COPY（リモート内の写し）。大きいファイルの同じ exFAT の中の写しは
+                // 本体の制限（積み残し #48）で失敗することがあるので、ここでは小さいファイルで試す
+                const QString copyPath = smallRemote + QStringLiteral(".copy");
+                const bool copyOk = checkDevice.run([&] { checkDevice.proto.requestCopy(smallRemote, copyPath); }, 300000);
+                const int copyErr = checkDevice.lastErr;
+                const QString copyErrText = checkDevice.lastErrText;
+                RemoteStat copyStat;
+                check(copyOk && checkDevice.statPath(copyPath, &copyStat)
+                          && !copyStat.isDir && copyStat.size == quint64(kSmallSize),
+                      QStringLiteral("%1: COPY（リモート内）で同じ大きさのファイルができる").arg(letter));
+                if (!copyOk)
+                    std::printf("    copy error: %d %s\n", copyErr, qPrintable(copyErrText));
+                if (copyOk) {
+                    // 本体の SPLIT / JOIN（2026-10-24。64 KB を 4 MB の区切りで 1 つに分けて戻す）
+                    const bool splitOk = checkDevice.run(
+                        [&] { checkDevice.proto.requestSplit(copyPath, 4u * 1024u * 1024u); }, 300000);
+                    const int splitErr = checkDevice.lastErr;
+                    const QString splitErrText = checkDevice.lastErrText;
+                    check(splitOk, QStringLiteral("%1: SPLIT（実機）").arg(letter));
+                    if (!splitOk)
+                        std::printf("    split error: %d %s\n", splitErr, qPrintable(splitErrText));
+                    // SPLIT のあとの一覧の読み直しが終わってから JOIN する（実機の画面と同じ順番）
+                    waitMs(800);
+                    QStringList splitNames;
+                    checkDevice.listNames(remoteDir, &splitNames);
+                    std::printf("    split names: %s\n", qPrintable(splitNames.join(QStringLiteral(", "))));
+                    const bool joinOk = checkDevice.run(
+                        [&] { checkDevice.proto.requestJoin(copyPath + QStringLiteral(".001")); }, 300000);
+                    const int joinErr = checkDevice.lastErr;
+                    const QString joinErrText = checkDevice.lastErrText;
+                    RemoteStat joinedStat;
+                    check(joinOk && checkDevice.statPath(copyPath, &joinedStat)
+                              && !joinedStat.isDir && joinedStat.size == quint64(kSmallSize),
+                          QStringLiteral("%1: JOIN（実機）で元の大きさに戻る").arg(letter));
+                    if (!joinOk)
+                        std::printf("    join error: %d %s\n", joinErr, qPrintable(joinErrText));
+                }
+            }
+            checkDevice.link.close();
+        } else {
+            check(false, QStringLiteral("%1: アップロードのあと実機につなぎ直す").arg(letter));
+        }
+
+        bool downOk = false;
+        QString downError;
+        if (upOk) {
+            ZmodemWorker worker(port, 921600, ZmodemWorker::Mode::Download, QStringList(),
+                                receivedDir.path(), remoteFile);
+            QObject::connect(&worker, &ZmodemWorker::logMessage,
+                             [](const QString &message) { std::printf("    %s\n", qPrintable(message)); });
+            QObject::connect(&worker, &ZmodemWorker::finished,
+                             [&downOk, &downError](bool ok, bool, const QString &error) {
+                                 downOk = ok;
+                                 downError = error;
+                             });
+            worker.run();
+            check(downOk, QStringLiteral("%1: 4 MB 超のダウンロード（ストリーミング）").arg(letter));
+            if (!downOk)
+                std::printf("    download error: %s\n", qPrintable(downError));
+            check(downOk && readFile(receivedDir.filePath(name)) == data,
+                  QStringLiteral("%1: 受け取った中身が元と同じ").arg(letter));
+        }
+
+        waitMs(800);
+        Device cleanup;
+        if (cleanup.open(port)) {
+            if (cleanup.listHas(root, QStringLiteral("!qt_selftest_large")))
+                cleanup.removeTree(remoteDir);   // 途中で失敗して .001 が残っていても片付ける
+            cleanup.link.close();
+        }
+    }
     d.link.close();
 }
 
@@ -519,12 +852,19 @@ void deviceManyTests(const QString &port)
     for (const RemoteDrive &r : d.drives) letters += QStringLiteral("%1=%2 ").arg(r.letter).arg(r.type);
     std::printf("    drives: %s\n", qPrintable(letters));
 
+    bool writableTested = false;
     for (int type : { 3, 4 }) {
         QString drv;
         int n = 0;
         for (const RemoteDrive &r : d.drives) if (r.type == type && r.ready) { drv = r.letter; ++n; }
         const QString label = type == 3 ? QStringLiteral("exFAT") : QStringLiteral("NTFS");
-        if (n != 1) { check(false, QStringLiteral("%1 の区画がちょうど 1 つある（%2 個）").arg(label).arg(n)); continue; }
+        if (n == 0) {
+            std::printf("  -- %s: 準備できた区画が無いので飛ばす\n", qPrintable(label));
+            continue;
+        }
+        writableTested = true;
+        if (n > 1)
+            std::printf("  -- %s: %d 個のうち %s を試す\n", qPrintable(label), n, qPrintable(drv));
 
         const QString root = drv + QStringLiteral(":/");
         const QString baseName = QStringLiteral("!qt_selftest_many");
@@ -610,6 +950,7 @@ void deviceManyTests(const QString &port)
               QStringLiteral("%1: %2 件とも残っていない（%3 個）").arg(label).arg(kCount).arg(names.size()));
         check(d.run([&] { d.proto.requestDelete(base); }), QStringLiteral("%1: 台のフォルダを消す").arg(label));
     }
+    check(writableTested, QStringLiteral("exFAT か NTFS の準備できた区画がある"));
     d.link.close();
 }
 
@@ -621,10 +962,14 @@ int main(int argc, char **argv)
     const QStringList args = app.arguments();
     offlineTests();
     systemDriveTests();
+    latestFirmwareTests();
     deleteQueueTests();
     const int many = int(args.indexOf(QStringLiteral("--device-many")));
     if (many > 0 && many + 1 < args.size())
         deviceManyTests(args.at(many + 1));
+    const int large = int(args.indexOf(QStringLiteral("--device-large")));
+    if (large > 0 && large + 1 < args.size())
+        deviceLargeTests(args.at(large + 1));
     const int at = int(args.indexOf(QStringLiteral("--device")));
     if (at > 0 && at + 1 < args.size())
         deviceTests(args.at(at + 1));

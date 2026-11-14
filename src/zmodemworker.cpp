@@ -1,6 +1,13 @@
 #include "zmodemworker.h"
 
+#include "uploadsplit.h"
+
+#include <QDir>
 #include <QElapsedTimer>
+#include <QFileInfo>
+#include <QLocale>
+#include <QSet>
+#include <QTemporaryDir>
 #include <QThread>
 
 #include <algorithm>
@@ -14,6 +21,9 @@
 #include <unistd.h>
 
 namespace {
+
+// sgnano の uartcon.h（2026-11-14）の 1 行の上限（頭の 0x1E と改行を除く）
+constexpr int kMaxRemoteCommandBytes = 320;
 
 speed_t speedForBaud(int baud, bool *ok)
 {
@@ -36,6 +46,20 @@ speed_t speedForBaud(int baud, bool *ok)
 QString errnoText(int value)
 {
     return QString::fromLocal8Bit(std::strerror(value));
+}
+
+QString joinRemotePath(const QString &base, const QString &name)
+{
+    if (base.isEmpty())
+        return name;
+    if (base.endsWith(QLatin1Char('/')))
+        return base + name;
+    return base + QLatin1Char('/') + name;
+}
+
+QString partName(const QString &baseName, int number)
+{
+    return QStringLiteral("%1.%2").arg(baseName).arg(number, 3, 10, QLatin1Char('0'));
 }
 
 }
@@ -308,6 +332,85 @@ void ZmodemWorker::cancel()
     m_canceled.store(true);
 }
 
+bool ZmodemWorker::prepareUpload(QStringList *sendFiles, QList<JoinJob> *joins, QString *error)
+{
+    sendFiles->clear();
+    joins->clear();
+
+    // 環境変数が無いときは、64 MB 以下は 1 MB ずつ（実機の exFAT・NTFS で PSRAM が細いときも通りやすい）、
+    // 64 MB を越えるものは 2 MB ずつ（64 個の JOIN 上限に収める）にする。
+    const bool partSizeSet = !qEnvironmentVariableIsEmpty("SGNANO_ZM_PART");
+    const quint32 configuredPartSize = UploadSplit::partSizeFromEnvironment();
+    QSet<QString> remoteNames;
+    int splitIndex = 0;
+    for (const QString &path : m_files) {
+        const QFileInfo info(path);
+        if (!info.isFile()) {
+            *error = QStringLiteral("ファイルがありません: %1").arg(path);
+            return false;
+        }
+        // 同じ名前を 2 つ送ると、実機の同じフォルダで後から来たものが先のものを置き換えてしまう
+        const QString remoteName = info.fileName().toCaseFolded();
+        if (remoteNames.contains(remoteName)) {
+            *error = QStringLiteral("同じ名前のファイルは一度に送れません: %1").arg(info.fileName());
+            return false;
+        }
+        remoteNames.insert(remoteName);
+        if (quint64(info.size()) <= UploadSplit::kDeviceFileMax) {
+            sendFiles->append(path);
+            continue;
+        }
+
+        if (m_remotePath.trimmed().isEmpty()) {
+            *error = QStringLiteral("4 MB を越えるファイルを送るには、リモートのフォルダを開いてください");
+            return false;
+        }
+        if (info.fileName().contains(QLatin1Char('\t')) || info.fileName().contains(QLatin1Char('\n'))
+            || info.fileName().contains(QLatin1Char('\r'))) {
+            *error = QStringLiteral("4 MB を越えるファイルの名前にはタブや改行を使えません: %1").arg(info.fileName());
+            return false;
+        }
+        if (!m_splitDir) {
+            m_splitDir = std::make_unique<QTemporaryDir>(
+                QDir::tempPath() + QStringLiteral("/sgnano_remote_split_XXXXXX"));
+            if (!m_splitDir->isValid()) {
+                *error = QStringLiteral("分けたファイルを置く一時フォルダを作れません: %1")
+                             .arg(m_splitDir->errorString());
+                return false;
+            }
+        }
+
+        // 同じ名前のファイルを 2 つ選んでも .001 がぶつからないよう、元のファイルごとに別の入れ物へ分ける
+        const QString splitSubDir = m_splitDir->filePath(QString::number(++splitIndex));
+        if (!QDir().mkpath(splitSubDir)) {
+            *error = QStringLiteral("分けたファイルを置く一時フォルダを作れません: %1").arg(splitSubDir);
+            return false;
+        }
+
+        const quint32 partSize = UploadSplit::partSizeForFile(
+            quint64(info.size()), partSizeSet, configuredPartSize);
+        QStringList parts;
+        if (!UploadSplit::splitFile(path, splitSubDir, partSize, &parts, error))
+            return false;
+
+        JoinJob job;
+        job.baseName = info.fileName();
+        job.parts = int(parts.size());
+        const QString joinPath = joinRemotePath(m_remotePath, partName(job.baseName, 1));
+        if (int(sizeof("JOIN ") - 1) + joinPath.toUtf8().size() >= kMaxRemoteCommandBytes) {
+            *error = QStringLiteral("結合のコマンドが長すぎます（パスを短くしてください）: %1").arg(joinPath);
+            return false;
+        }
+        joins->append(job);
+        sendFiles->append(parts);
+        emit logMessage(tr("%1 は 4 MB を越えるため %2 個に分けて送り、実機で結合します（1 つ %3）")
+                            .arg(info.fileName())
+                            .arg(parts.size())
+                            .arg(QLocale().formattedDataSize(qint64(partSize))));
+    }
+    return true;
+}
+
 bool ZmodemWorker::waitForRemote(ZmodemIo &io, QString *error)
 {
     if (m_remotePath.isEmpty() || m_remotePath.contains(QLatin1Char('\n'))
@@ -317,10 +420,16 @@ bool ZmodemWorker::waitForRemote(ZmodemIo &io, QString *error)
     }
 
     const bool download = m_mode == Mode::Download;
+    QByteArray commandText = download ? QByteArrayLiteral("ZGET ") : QByteArrayLiteral("ZPUT ");
+    commandText.append(m_remotePath.toUtf8());
+    if (commandText.size() >= kMaxRemoteCommandBytes) {
+        *error = QStringLiteral("リモートのパスが長すぎます（%1 バイトまで）").arg(kMaxRemoteCommandBytes - 1);
+        return false;
+    }
+
     QByteArray command;
     command.append('\x1e');
-    command.append(download ? QByteArrayLiteral("ZGET ") : QByteArrayLiteral("ZPUT "));
-    command.append(m_remotePath.toUtf8());
+    command.append(commandText);
     command.append('\n');
 
     if (!io.put(command) || !io.flush()) {
@@ -414,10 +523,161 @@ bool ZmodemWorker::waitForRemote(ZmodemIo &io, QString *error)
     return false;
 }
 
+bool ZmodemWorker::waitForRemoteCommands(ZmodemIo &io, QString *error)
+{
+    emit logMessage(tr("実機が遠隔コマンドを受け付けるのを待っています…"));
+
+    QByteArray pending;
+    for (int attempt = 0; attempt < 15; ++attempt) {
+        if (m_canceled.load()) {
+            *error = QStringLiteral("転送を中止しました");
+            return false;
+        }
+        if (!io.put(QByteArrayLiteral("\x1ePING\n")) || !io.flush()) {
+            *error = io.errorString().isEmpty()
+                ? QStringLiteral("sgnano に PING を送れませんでした")
+                : io.errorString();
+            return false;
+        }
+
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < 500) {
+            const int c = io.getc(100);
+            if (c == ZmodemIo::Cancel) {
+                *error = QStringLiteral("転送を中止しました");
+                return false;
+            }
+            if (c == ZmodemIo::Error) {
+                *error = io.errorString().isEmpty()
+                    ? QStringLiteral("シリアルポートの読み書きに失敗しました")
+                    : io.errorString();
+                return false;
+            }
+            if (c >= 0)
+                pending.append(char(c));
+            if (pending.contains("@SG\tPONG"))
+                return true;
+            if (pending.size() > 65536)
+                pending.remove(0, pending.size() - 4096);
+        }
+    }
+
+    *error = QStringLiteral("ZMODEM のあと、sgnano が PING に答えません");
+    return false;
+}
+
+bool ZmodemWorker::runRemoteCommand(ZmodemIo &io, const QString &command, int timeoutMs,
+                                    QString *response, QString *error)
+{
+    if (command.toUtf8().size() >= kMaxRemoteCommandBytes) {
+        *error = QStringLiteral("遠隔コマンドが長すぎます: %1").arg(command);
+        return false;
+    }
+    QByteArray packet;
+    packet.append('\x1e');
+    packet.append(command.toUtf8());
+    packet.append('\n');
+    if (!io.put(packet) || !io.flush()) {
+        *error = io.errorString().isEmpty()
+            ? QStringLiteral("sgnano に %1 を送れませんでした").arg(command)
+            : io.errorString();
+        return false;
+    }
+
+    QByteArray pending;
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeoutMs) {
+        const int c = io.getc(100);
+        if (c == ZmodemIo::Cancel) {
+            *error = QStringLiteral("転送を中止しました");
+            return false;
+        }
+        if (c == ZmodemIo::Error) {
+            *error = io.errorString().isEmpty()
+                ? QStringLiteral("シリアルポートの読み書きに失敗しました")
+                : io.errorString();
+            return false;
+        }
+        if (c < 0)
+            continue;
+
+        pending.append(char(c));
+        if (pending.size() > 65536)
+            pending.remove(0, pending.size() - 4096);
+        for (;;) {
+            const int newline = pending.indexOf('\n');
+            if (newline < 0)
+                break;
+            QByteArray line = pending.left(newline);
+            pending.remove(0, newline + 1);
+            if (line.endsWith('\r'))
+                line.chop(1);
+            if (line.startsWith("@SG\tOK")) {
+                if (response)
+                    *response = QString::fromUtf8(line);
+                return true;
+            }
+            if (line.startsWith("@SG\tERR")) {
+                const QList<QByteArray> fields = line.split('\t');
+                const int code = fields.size() > 2 ? fields.at(2).toInt() : 0;
+                const QString why = fields.size() > 3
+                    ? QString::fromUtf8(fields.mid(3).join('\t'))
+                    : QStringLiteral("不明なエラー");
+                *error = QStringLiteral("%1 に失敗しました: %2 (code %3)").arg(command, why).arg(code);
+                return false;
+            }
+        }
+    }
+
+    *error = QStringLiteral("%1 の応答がありません").arg(command);
+    return false;
+}
+
+bool ZmodemWorker::joinUploadedFiles(ZmodemIo &io, const QList<JoinJob> &joins, QString *error)
+{
+    if (joins.isEmpty())
+        return true;
+    if (!waitForRemoteCommands(io, error))
+        return false;
+
+    for (const JoinJob &job : joins) {
+        const QString firstPath = joinRemotePath(m_remotePath, partName(job.baseName, 1));
+        emit logMessage(tr("実機で結合します: %1").arg(firstPath));
+
+        QString response;
+        if (!runRemoteCommand(io, QStringLiteral("JOIN ") + firstPath, 600000, &response, error))
+            return false;
+        if (!response.startsWith(QStringLiteral("@SG\tOK\tJOIN"))) {
+            *error = QStringLiteral("sgnano が結合を受け付けませんでした: %1").arg(response);
+            return false;
+        }
+
+        // 本体の JOIN は .001 .. を残す（scripts/zm.py と同じく PC から消す）
+        for (int k = 1; k <= job.parts; ++k) {
+            const QString partPath = joinRemotePath(m_remotePath, partName(job.baseName, k));
+            QString ignored;
+            QString deleteError;
+            if (!runRemoteCommand(io, QStringLiteral("DEL ") + partPath, 60000, &ignored, &deleteError))
+                emit logMessage(tr("分けたファイルを消せません: %1 (%2)").arg(partPath, deleteError));
+        }
+        emit logMessage(tr("実機で結合しました: %1（%2 個）").arg(job.baseName).arg(job.parts));
+    }
+    return true;
+}
+
 void ZmodemWorker::run()
 {
-    ZmodemSerialIo io(m_port, m_baud, &m_canceled);
     QString error;
+    QStringList uploadFiles;
+    QList<JoinJob> joins;
+    if (m_mode == Mode::Upload && !prepareUpload(&uploadFiles, &joins, &error)) {
+        emit finished(false, m_canceled.load(), error);
+        return;
+    }
+
+    ZmodemSerialIo io(m_port, m_baud, &m_canceled);
     if (!io.open(&error)) {
         emit finished(false, false, error);
         return;
@@ -439,7 +699,9 @@ void ZmodemWorker::run()
 
     bool ok = false;
     if (m_mode == Mode::Upload) {
-        ok = zmodem.sendFiles(m_files, &error);
+        ok = zmodem.sendFiles(uploadFiles, &error);
+        if (ok && !joins.isEmpty())
+            ok = joinUploadedFiles(io, joins, &error);
     } else {
         QStringList received;
         ok = zmodem.receiveFiles(m_localDir, &received, &error);

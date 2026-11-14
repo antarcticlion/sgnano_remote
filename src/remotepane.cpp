@@ -135,9 +135,9 @@ QStringList scanSerialPorts()
 
 QString driveTypeText(const RemoteDrive &drive)
 {
-    // S: は本体の内蔵フラッシュ（FAT12、2MB）。DRIVES の種類は FAT（1）で返るので、文字で見分ける。
+    // S: は本体の内蔵フラッシュ（FAT12、2026-11-02 から 4 MB）。DRIVES の種類は FAT（1）で返るので、文字で見分ける。
     if (drive.isSystem())
-        return QStringLiteral("内蔵フラッシュ (FAT12)");
+        return QStringLiteral("内蔵フラッシュ (FAT12, 4 MB)");
 
     switch (drive.type) {
     case 1: return QStringLiteral("FAT");
@@ -306,6 +306,7 @@ RemotePane::RemotePane(QWidget *parent)
     connect(m_protocol, &RemoteProtocol::entryReceived, this, &RemotePane::onEntryReceived);
     connect(m_protocol, &RemoteProtocol::listFinished, this, &RemotePane::onListFinished);
     connect(m_protocol, &RemoteProtocol::statReceived, this, &RemotePane::onStatReceived);
+    connect(m_protocol, &RemoteProtocol::fsckFinished, this, &RemotePane::onFsckFinished);
     connect(m_protocol, &RemoteProtocol::operationSucceeded, this, &RemotePane::onOperationSucceeded);
     connect(m_protocol, &RemoteProtocol::requestFailed, this, &RemotePane::onRequestFailed);
     connect(m_protocol, &RemoteProtocol::requestTimedOut, this, &RemotePane::onRequestTimedOut);
@@ -578,6 +579,18 @@ int RemotePane::currentBaud() const
     return ok ? baud : 921600;
 }
 
+int RemotePane::currentDriveType() const
+{
+    if (m_remotePathText.size() < 2 || m_remotePathText.at(1) != QLatin1Char(':'))
+        return -1;
+    const QString letter = m_remotePathText.left(1).toUpper();
+    for (const RemoteDrive &drive : m_drives) {
+        if (drive.letter.compare(letter, Qt::CaseInsensitive) == 0)
+            return drive.type;
+    }
+    return -1;
+}
+
 void RemotePane::disconnectRemote()
 {
     if (m_link->isOpen())
@@ -618,8 +631,10 @@ void RemotePane::onOpened(const QString &port, int baud)
     m_rxBytes = 0;
     clearOperations();
     m_entries.clear();
+    m_drives.clear();
     m_model->removeRows(0, m_model->rowCount());
     m_remotePathText.clear();
+    m_copySource.clear();
     m_updatingDrives = true;
     m_driveCombo->clear();
     m_updatingDrives = false;
@@ -657,8 +672,10 @@ void RemotePane::onClosed()
     clearOperations();
     m_protocol->reset();
     m_entries.clear();
+    m_drives.clear();
     m_model->removeRows(0, m_model->rowCount());
     m_remotePathText.clear();
+    m_copySource.clear();
     m_updatingDrives = true;
     m_driveCombo->clear();
     m_updatingDrives = false;
@@ -700,6 +717,7 @@ void RemotePane::onProtocolSynchronized()
 
 void RemotePane::onDrivesReceived(const QList<RemoteDrive> &drives)
 {
+    m_drives = drives;
     m_updatingDrives = true;
     m_driveCombo->clear();
     for (const RemoteDrive &drive : drives) {
@@ -766,6 +784,23 @@ void RemotePane::onStatReceived(const RemoteStat &stat)
                              QLocale().formattedDataSize(qint64(stat.size), 1)));
 }
 
+void RemotePane::onFsckFinished(const RemoteFsckResult &result)
+{
+    const QString text = tr("%1: ファイル %2・フォルダ %3\n"
+                            "大きさを直した数 %4・空きにした数 %5・交差した鎖 %6・壊れた鎖 %7・FAT2 を直した数 %8")
+                             .arg(result.repair ? tr("S: を修復しました") : tr("S: を検査しました"))
+                             .arg(result.files)
+                             .arg(result.dirs)
+                             .arg(result.sizeFixed)
+                             .arg(result.freed)
+                             .arg(result.cross)
+                             .arg(result.bad)
+                             .arg(result.fat2Fixed);
+    emit logMessage(text);
+    QMessageBox::information(this, result.repair ? tr("S: の修復") : tr("S: の検査"), text);
+    operationFinished();
+}
+
 void RemotePane::onRequestFailed(const QString &command, int code, const QString &message)
 {
     emit logMessage(tr("%1 に失敗しました: %2 (code %3)").arg(command, message).arg(code));
@@ -776,7 +811,9 @@ void RemotePane::onRequestFailed(const QString &command, int code, const QString
         m_hint->setText(tr("一覧を取得できません: %1").arg(message));
         syncDriveCombo();
     } else if (command.startsWith(QStringLiteral("DEL")) || command.startsWith(QStringLiteral("REN"))
-               || command.startsWith(QStringLiteral("MKDIR"))) {
+               || command.startsWith(QStringLiteral("MKDIR")) || command.startsWith(QStringLiteral("COPY"))
+               || command.startsWith(QStringLiteral("JOIN")) || command.startsWith(QStringLiteral("SPLIT"))
+               || command.startsWith(QStringLiteral("SYSFSCK"))) {
         m_opErrors.append(tr("%1: %2").arg(command.section(QLatin1Char(' '), 1).replace(QLatin1Char('\t'), QStringLiteral(" → ")), message));
         operationFinished();
     } else if (command.startsWith(QStringLiteral("CWD"))) {
@@ -1044,7 +1081,7 @@ void RemotePane::setConnectedUi(bool connected)
 
 void RemotePane::updateTransferButtons()
 {
-    const bool idle = m_link->isOpen() && !m_protocol->isBusy();
+    const bool idle = m_link->isOpen() && !m_protocol->isBusy() && !operationsInProgress();
     m_remotePath->setEnabled(m_link->isOpen() && !operationsInProgress());
     m_driveCombo->setEnabled(idle);
     m_refreshButton->setEnabled(idle);
@@ -1090,6 +1127,18 @@ QStringList RemotePane::protectedSystemNames(const QList<SelectedItem> &items) c
 
 void RemotePane::showContextMenu(const QPoint &pos)
 {
+    // 右クリックした項目が選ばれていなければ、その項目を選ぶ（メニューの対象を直感に合わせる）
+    if (m_tree->selectionModel()) {
+        const QModelIndex index = m_tree->indexAt(pos);
+        if (index.isValid() && !m_tree->selectionModel()->isSelected(index))
+            m_tree->selectionModel()->select(index, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    }
+
+    const bool idle = m_link->isOpen() && !m_protocol->isBusy() && !operationsInProgress();
+    const QList<SelectedItem> items = selectedItems();
+    const bool oneFile = items.size() == 1 && !items.first().isDir;
+    const bool writable = RemoteFs::isWritableDriveType(currentDriveType());
+
     QMenu menu(this);
     QAction *mk = menu.addAction(tr("新しいフォルダ…"), this, &RemotePane::createFolder);
     QAction *rn = menu.addAction(tr("名前の変更…"), this, &RemotePane::renameSelected);
@@ -1097,10 +1146,34 @@ void RemotePane::showContextMenu(const QPoint &pos)
     QAction *dl = menu.addAction(tr("削除…"), this, &RemotePane::deleteSelected);
     dl->setShortcut(QKeySequence::Delete);
     menu.addSeparator();
+    QAction *cp = menu.addAction(tr("コピー（リモート内）"), this, &RemotePane::copySelectedFile);
+    QAction *pst = menu.addAction(tr("貼り付け"), this, &RemotePane::pasteRemoteCopy);
+    menu.addSeparator();
+    QAction *join = menu.addAction(tr("結合 (.001)…"), this, &RemotePane::joinSelected);
+    QAction *split = menu.addAction(tr("分割 (4 MB ずつ)…"), this, &RemotePane::splitSelected);
+    QAction *fsck = nullptr;
+    QAction *repair = nullptr;
+    const bool systemDrive = RemoteFs::isSystemDrivePath(m_remotePathText);
+    if (systemDrive) {
+        menu.addSeparator();
+        fsck = menu.addAction(tr("S: を検査…"), this, &RemotePane::checkSystemDrive);
+        repair = menu.addAction(tr("S: を修復…"), this, &RemotePane::repairSystemDrive);
+    }
+    menu.addSeparator();
     menu.addAction(tr("更新"), this, &RemotePane::refreshRemote);
+
     mk->setEnabled(m_mkdirButton->isEnabled());
     rn->setEnabled(m_renameButton->isEnabled());
     dl->setEnabled(m_deleteButton->isEnabled());
+    cp->setEnabled(idle && oneFile);
+    pst->setEnabled(idle && !m_copySource.isEmpty());
+    join->setEnabled(idle && writable && oneFile
+                     && items.first().name.endsWith(QStringLiteral(".001")));
+    split->setEnabled(idle && writable && oneFile);
+    if (fsck)
+        fsck->setEnabled(idle);
+    if (repair)
+        repair->setEnabled(idle);
     menu.exec(m_tree->viewport()->mapToGlobal(pos));
 }
 
@@ -1139,7 +1212,7 @@ void RemotePane::operationFinished()
 
 void RemotePane::createFolder()
 {
-    if (!m_mkdirButton->isEnabled())
+    if (!m_mkdirButton->isEnabled() || operationsInProgress())
         return;
     bool ok = false;
     const QString name = QInputDialog::getText(this, tr("新しいフォルダ"),
@@ -1228,12 +1301,165 @@ void RemotePane::deleteSelected()
     m_deleteQueue->start(paths);
 }
 
+void RemotePane::copySelectedFile()
+{
+    if (!m_link->isOpen() || m_protocol->isBusy() || operationsInProgress())
+        return;
+    const QList<SelectedItem> items = selectedItems();
+    if (items.size() != 1 || items.first().isDir)
+        return;
+
+    m_copySource = joinRemotePath(m_remotePathText, items.first().name);
+    emit logMessage(tr("コピーするファイルを選びました: %1").arg(m_copySource));
+}
+
+void RemotePane::pasteRemoteCopy()
+{
+    if (m_copySource.isEmpty() || !m_link->isOpen() || m_protocol->isBusy() || operationsInProgress())
+        return;
+    if (!RemoteFs::isWritableDriveType(currentDriveType())) {
+        QMessageBox::warning(this, tr("貼り付け"), tr("このドライブには書けません。"));
+        return;
+    }
+
+    const QString name = QFileInfo(m_copySource).fileName();
+    if (name.isEmpty())
+        return;
+    const QString target = joinRemotePath(m_remotePathText, name);
+    if (target.compare(m_copySource, Qt::CaseInsensitive) == 0) {
+        QMessageBox::information(this, tr("貼り付け"), tr("同じファイルなので写せません。"));
+        return;
+    }
+
+    const auto answer = QMessageBox::question(
+        this, tr("リモート内でコピー"),
+        tr("%1\nを\n%2\nへ写します。同名のファイルは置き換えます。実行しますか？")
+            .arg(m_copySource, target),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes)
+        return;
+
+    clearOperations();
+    m_opsPending = 1;
+    emit logMessage(tr("コピーします: %1 → %2").arg(m_copySource, target));
+    m_protocol->requestCopy(m_copySource, target);
+    m_copySource.clear();
+}
+
+void RemotePane::joinSelected()
+{
+    if (!m_link->isOpen() || m_protocol->isBusy() || operationsInProgress())
+        return;
+    if (!RemoteFs::isWritableDriveType(currentDriveType())) {
+        QMessageBox::warning(this, tr("結合"), tr("このドライブでは結合できません。"));
+        return;
+    }
+    const QList<SelectedItem> items = selectedItems();
+    if (items.size() != 1 || items.first().isDir
+        || !items.first().name.endsWith(QStringLiteral(".001"))) {
+        return;
+    }
+
+    const QString path = joinRemotePath(m_remotePathText, items.first().name);
+    const auto answer = QMessageBox::question(
+        this, tr("結合"),
+        tr("%1 から .002、.003 … を順につないで、.001 を取った名前のファイルを作ります。\n"
+           "同名のファイルは置き換えます。実行しますか？")
+            .arg(path),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes)
+        return;
+
+    clearOperations();
+    m_opsPending = 1;
+    emit logMessage(tr("結合します: %1").arg(path));
+    m_protocol->requestJoin(path);
+}
+
+void RemotePane::splitSelected()
+{
+    if (!m_link->isOpen() || m_protocol->isBusy() || operationsInProgress())
+        return;
+    if (!RemoteFs::isWritableDriveType(currentDriveType())) {
+        QMessageBox::warning(this, tr("分割"), tr("このドライブでは分割できません。"));
+        return;
+    }
+    const QList<SelectedItem> items = selectedItems();
+    if (items.size() != 1 || items.first().isDir)
+        return;
+
+    const QString path = joinRemotePath(m_remotePathText, items.first().name);
+    const auto answer = QMessageBox::question(
+        this, tr("分割"),
+        tr("%1 を 4 MB ずつに分けて、同じフォルダへ %2.001、.002 … を作ります。\n"
+           "同名のファイルは置き換えます。実行しますか？")
+            .arg(path, items.first().name),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes)
+        return;
+
+    clearOperations();
+    m_opsPending = 1;
+    emit logMessage(tr("分割します: %1").arg(path));
+    m_protocol->requestSplit(path, 4u * 1024u * 1024u);
+}
+
+void RemotePane::checkSystemDrive()
+{
+    if (!m_link->isOpen() || m_protocol->isBusy() || operationsInProgress())
+        return;
+    if (!RemoteFs::isSystemDrivePath(m_remotePathText)) {
+        emit logMessage(tr("S: を開いているときだけ検査できます"));
+        return;
+    }
+
+    clearOperations();
+    m_opsPending = 1;
+    m_hint->setText(tr("S: の FAT12 を検査しています…"));
+    m_protocol->requestSysFsck(false);
+}
+
+void RemotePane::repairSystemDrive()
+{
+    if (!m_link->isOpen() || m_protocol->isBusy() || operationsInProgress())
+        return;
+    if (!RemoteFs::isSystemDrivePath(m_remotePathText)) {
+        emit logMessage(tr("S: を開いているときだけ修復できます"));
+        return;
+    }
+
+    const auto answer = QMessageBox::question(
+        this, tr("S: の修復"),
+        tr("S:（内蔵フラッシュ）の FAT12 を検査して、直せるところを直します。\n"
+           "ファイルの大きさや余分な鎖、未接続のクラスタを直します。実行しますか？"),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes)
+        return;
+
+    clearOperations();
+    m_opsPending = 1;
+    m_hint->setText(tr("S: の FAT12 を修復しています…"));
+    m_protocol->requestSysFsck(true);
+}
+
 void RemotePane::onOperationSucceeded(const QString &operation, const QString &path)
 {
-    emit logMessage(tr("%1 しました: %2").arg(operation == QStringLiteral("DEL") ? tr("削除")
-                                              : operation == QStringLiteral("REN") ? tr("名前を変更")
-                                                                                     : tr("フォルダを作成"),
-                                              path));
+    QString what;
+    if (operation == QStringLiteral("DEL"))
+        what = tr("削除");
+    else if (operation == QStringLiteral("REN"))
+        what = tr("名前を変更");
+    else if (operation == QStringLiteral("MKDIR"))
+        what = tr("フォルダを作成");
+    else if (operation == QStringLiteral("COPY"))
+        what = tr("コピー");
+    else if (operation == QStringLiteral("JOIN"))
+        what = tr("結合");
+    else if (operation == QStringLiteral("SPLIT"))
+        what = tr("分割");
+    else
+        what = operation;
+    emit logMessage(tr("%1 しました: %2").arg(what, path));
     operationFinished();
 }
 
@@ -1268,7 +1494,7 @@ QString RemotePane::currentRemotePath() const
 
 bool RemotePane::isIdle() const
 {
-    return m_link->isOpen() && !m_protocol->isBusy();
+    return m_link->isOpen() && !m_protocol->isBusy() && !operationsInProgress();
 }
 
 QStringList RemotePane::selectedRemoteFiles() const

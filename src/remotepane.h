@@ -31,6 +31,7 @@ public:
     QString currentPort() const;
     int currentBaud() const;
     QString currentRemotePath() const;
+    int currentDriveType() const;
     QStringList selectedRemoteFiles() const;
     bool isIdle() const;
     void saveSettings();
@@ -47,6 +48,9 @@ public slots:
     void deleteSelected();
     void renameSelected();
     void createFolder();
+    // 2026-11-14 の sgnano に合わせて足したもの
+    void checkSystemDrive();          // SYSFSCK（S: の FAT12 を検査）
+    void repairSystemDrive();         // SYSFSCK REPAIR（S: の FAT12 を修復）
 
 signals:
     void connectionStateChanged(bool connected, const QString &description);
@@ -67,6 +71,7 @@ private slots:
     void onEntryReceived(const RemoteEntry &entry);
     void onListFinished(int count, bool truncated);
     void onStatReceived(const RemoteStat &stat);
+    void onFsckFinished(const RemoteFsckResult &result);
     void onRequestFailed(const QString &command, int code, const QString &message);
     void onRequestTimedOut(const QString &command);
     void onConsoleLine(const QString &line);
@@ -77,6 +82,10 @@ private slots:
     void updateTransferButtons();
     void onOperationSucceeded(const QString &operation, const QString &path);
     void showContextMenu(const QPoint &pos);
+    void copySelectedFile();
+    void pasteRemoteCopy();
+    void joinSelected();
+    void splitSelected();
 
 private:
     void buildUi();
@@ -122,12 +131,14 @@ private:
     QStandardItemModel *m_model = nullptr;
     QSortFilterProxyModel *m_proxy = nullptr;
     QList<RemoteEntry> m_entries;
+    QList<RemoteDrive> m_drives;
     QString m_remotePathText;
     QString m_pendingRefreshPath;
+    QString m_copySource;           // 右ペインの中で写すファイル（COPY 元）
     bool m_updatingDrives = false;
     bool m_cancelingStray = false;
     quint64 m_openGeneration = 0;
     quint64 m_rxBytes = 0;
-    int m_opsPending = 0;           // 送信済みで返事を待っている DEL / REN / MKDIR の数
+    int m_opsPending = 0;           // 送信済みで返事を待っている DEL / REN / MKDIR / COPY / JOIN / SPLIT / SYSFSCK の数
     QStringList m_opErrors;         // そのまとまりの失敗（終わったらまとめて出す）
 };
