@@ -11,20 +11,26 @@
 #include <QThread>
 
 #include <algorithm>
-#include <cerrno>
 #include <cstring>
 #include <utility>
+
+#ifdef Q_OS_WIN
+#include "win32serial.h"
+#else
+#include <cerrno>
 
 #include <fcntl.h>
 #include <poll.h>
 #include <termios.h>
 #include <unistd.h>
+#endif
 
 namespace {
 
 // sgnano の uartcon.h（2026-11-14）の 1 行の上限（頭の 0x1E と改行を除く）
 constexpr int kMaxRemoteCommandBytes = 320;
 
+#ifndef Q_OS_WIN
 speed_t speedForBaud(int baud, bool *ok)
 {
     *ok = true;
@@ -47,6 +53,7 @@ QString errnoText(int value)
 {
     return QString::fromLocal8Bit(std::strerror(value));
 }
+#endif
 
 QString joinRemotePath(const QString &base, const QString &name)
 {
@@ -64,6 +71,7 @@ QString partName(const QString &baseName, int number)
 
 }
 
+#ifndef Q_OS_WIN
 // ブロックして読み書きするシリアルポート。ZMODEM は 1 バイトずつ待つので、
 // SerialLink の QSocketNotifier ではなく、専用のスレッドで poll して待つ。
 class ZmodemSerialIo : public ZmodemIo
@@ -314,6 +322,154 @@ private:
     QByteArray m_rx;
     QString m_error;
 };
+#else
+// Windows の COM ポート（2026-11-15）。ZMODEM は専用のスレッドで動くので、
+// Win32SerialPort の時間切れ付きの読み書きをそのまま使う。
+class ZmodemSerialIo : public ZmodemIo
+{
+public:
+    ZmodemSerialIo(QString port, int baud, std::atomic_bool *canceled)
+        : m_portName(std::move(port))
+        , m_baud(baud)
+        , m_canceled(canceled)
+    {
+    }
+
+    ~ZmodemSerialIo() override
+    {
+        close();
+    }
+
+    bool open(QString *error)
+    {
+        m_error.clear();
+        return m_serial.open(m_portName, m_baud, error);
+    }
+
+    void close()
+    {
+        m_serial.close();
+        m_rx.clear();
+    }
+
+    void pushBack(const QByteArray &data) override
+    {
+        if (!data.isEmpty())
+            m_rx.prepend(data);
+    }
+
+    int getc(unsigned timeoutMs) override
+    {
+        if (!m_rx.isEmpty())
+            return takeByte();
+        if (!m_error.isEmpty())
+            return ZmodemIo::Error;
+
+        QElapsedTimer timer;
+        timer.start();
+        for (;;) {
+            if (m_canceled->load())
+                return ZmodemIo::Cancel;
+            if (!m_error.isEmpty())
+                return ZmodemIo::Error;
+
+            const qint64 elapsed = timer.elapsed();
+            if (elapsed >= qint64(timeoutMs))
+                return ZmodemIo::Timeout;
+
+            const int wait = int(std::min<qint64>(50, qint64(timeoutMs) - elapsed));
+            if (wait <= 0)
+                return ZmodemIo::Timeout;
+
+            QString message;
+            char c = 0;
+            const int n = m_serial.read(&c, 1, wait, &message);
+            if (n > 0)
+                return quint8(c);
+            if (n < 0) {
+                fail(message.isEmpty() ? QStringLiteral("受信に失敗しました") : message);
+                return ZmodemIo::Error;
+            }
+        }
+    }
+
+    bool put(const QByteArray &data) override
+    {
+        if (!m_error.isEmpty())
+            return false;
+
+        const char *p = data.constData();
+        qsizetype left = data.size();
+        QElapsedTimer timer;
+        timer.start();
+        while (left > 0) {
+            if (m_canceled->load()) {
+                fail(QStringLiteral("転送を中止しました"));
+                return false;
+            }
+
+            QString message;
+            const int n = m_serial.write(p, int(left), 5000, &message);
+            if (n <= 0) {
+                fail(message.isEmpty() ? QStringLiteral("送信に失敗しました") : message);
+                return false;
+            }
+            p += n;
+            left -= n;
+            if (timer.elapsed() > 5000) {
+                fail(QStringLiteral("送信が止まりました"));
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool flush() override
+    {
+        QString message;
+        if (!m_serial.flush(&message)) {
+            fail(message.isEmpty() ? QStringLiteral("送信を終えられません") : message);
+            return false;
+        }
+        return true;
+    }
+
+    bool rxReady() override
+    {
+        if (!m_rx.isEmpty())
+            return true;
+        if (!m_error.isEmpty())
+            return true;
+        return m_serial.bytesAvailable() > 0;
+    }
+
+    QString errorString() const override
+    {
+        return m_error;
+    }
+
+private:
+    int takeByte()
+    {
+        const int c = quint8(m_rx.at(0));
+        m_rx.remove(0, 1);
+        return c;
+    }
+
+    void fail(const QString &message)
+    {
+        if (m_error.isEmpty())
+            m_error = message;
+    }
+
+    QString m_portName;
+    int m_baud = 921600;
+    std::atomic_bool *m_canceled = nullptr;
+    Win32SerialPort m_serial;
+    QByteArray m_rx;
+    QString m_error;
+};
+#endif
 
 ZmodemWorker::ZmodemWorker(QString port, int baud, Mode mode, QStringList files,
                            QString localDir, QString remotePath, QObject *parent)

@@ -1,5 +1,6 @@
 build/
 build-*/
+packaging/windows/*.exe
 *.user
 .qtcreator/
 backup_*/

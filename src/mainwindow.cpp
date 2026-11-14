@@ -33,7 +33,7 @@ MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
     setWindowTitle(tr("sgnano Remote Filer"));
-    setWindowIcon(QIcon::fromTheme(QStringLiteral("folder-remote")));
+    setWindowIcon(QIcon(QStringLiteral(":/icons/sgnano_remote.png")));
     resize(1240, 780);
 
     buildUi();

@@ -4,7 +4,15 @@
 #include <QObject>
 #include <QString>
 
+#ifdef Q_OS_WIN
+#include <QMutex>
+
+#include <memory>
+#endif
+
 class QSocketNotifier;
+class QTimer;
+class Win32SerialPort;
 
 class SerialLink : public QObject
 {
@@ -43,4 +51,10 @@ private:
     QSocketNotifier *m_readNotifier = nullptr;
     QSocketNotifier *m_writeNotifier = nullptr;
     QByteArray m_tx;
+
+#ifdef Q_OS_WIN
+    std::unique_ptr<Win32SerialPort> m_winPort;
+    QTimer *m_winTimer = nullptr;
+    mutable QMutex m_ioMutex;
+#endif
 };

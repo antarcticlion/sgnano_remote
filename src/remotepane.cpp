@@ -5,6 +5,10 @@
 #include "seriallink.h"
 #include "transfermime.h"
 
+#ifdef Q_OS_WIN
+#include "win32serial.h"
+#endif
+
 #include <QApplication>
 #include <QComboBox>
 #include <QDateTime>
@@ -106,6 +110,9 @@ private:
 
 QStringList scanSerialPorts()
 {
+#ifdef Q_OS_WIN
+    return Win32SerialPort::availablePorts();
+#else
     QStringList result;
 
     const QDir dev(QStringLiteral("/dev"));
@@ -131,6 +138,16 @@ QStringList scanSerialPorts()
     }
 
     return result;
+#endif
+}
+
+QString defaultSerialPort()
+{
+#ifdef Q_OS_WIN
+    return Win32SerialPort::defaultPort();
+#else
+    return QStringLiteral("/dev/ttyACM0");
+#endif
 }
 
 QString driveTypeText(const RemoteDrive &drive)
@@ -354,7 +371,7 @@ void RemotePane::buildUi()
     m_portCombo->setEditable(true);
     m_portCombo->setInsertPolicy(QComboBox::NoInsert);
     m_portCombo->setMinimumWidth(190);
-    m_portCombo->setToolTip(tr("デバッグプローブの UART ブリッジ（既定 /dev/ttyACM0）"));
+    m_portCombo->setToolTip(tr("デバッグプローブの UART ブリッジ（既定 %1）").arg(defaultSerialPort()));
 
     m_scanButton = new QToolButton(this);
     m_scanButton->setText(tr("再検索"));
@@ -557,14 +574,15 @@ void RemotePane::refreshPorts()
     if (!current.isEmpty())
         m_portCombo->setCurrentText(current);
     else if (m_portCombo->count() == 0)
-        m_portCombo->setCurrentText(QStringLiteral("/dev/ttyACM0"));
+        m_portCombo->setCurrentText(defaultSerialPort());
     m_portCombo->blockSignals(false);
 
     if (m_portCombo->currentText().isEmpty())
-        m_portCombo->setCurrentText(QStringLiteral("/dev/ttyACM0"));
+        m_portCombo->setCurrentText(defaultSerialPort());
 
     emit logMessage(tr("シリアルポート: %1").arg(
-        ports.isEmpty() ? tr("見つかりません（既定 /dev/ttyACM0）") : ports.join(QStringLiteral(", "))));
+        ports.isEmpty() ? tr("見つかりません（既定 %1）").arg(defaultSerialPort())
+                        : ports.join(QStringLiteral(", "))));
 }
 
 QString RemotePane::currentPort() const

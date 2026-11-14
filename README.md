@@ -34,6 +34,29 @@ sgnano の UART の遠隔コマンド（`@SG` で答える行、sgnano の `src/
 cmake -B build -G Ninja && ninja -C build
 ```
 
+## Windows 版（2026-11-15）
+Windows 10/11 x64 に対応しました。シリアルは COM ポート（既定は見つかった COM、無ければ COM3）、
+インストーラは **per-user**（管理者不要、`%LOCALAPPDATA%\Programs\sgnano_remote`）です。
+
+- Windows 実機で Qt と MinGW/MSVC を使って組む場合:
+  ```
+  powershell -ExecutionPolicy Bypass -File packaging\windows\build-windows.ps1 -QtDir C:\Qt\6.2.4\mingw_64
+  ```
+  `makensis.exe` と Qt の `windeployqt.exe` が必要です。完成物は `build-windows\sgnano_remote_setup_0.1.0.exe`。
+- WSL からクロスビルドする場合:
+  ```
+  sudo apt install g++-mingw-w64-x86-64 nsis
+  QT_DIR=~/Qt/6.2.4/mingw_64 packaging/windows/build-wsl.sh
+  ```
+  Linux 側の Qt 6 のホストツール（`QT_HOST_PATH`、既定 `/usr/lib/x86_64-linux-gnu/cmake`）も必要です。
+  Qt の DLL は GCC 11.2 製ですが、アプリ側の libstdc++/libgcc は静的に結ぶので、Ubuntu の MinGW（GCC 10）でも起動できます。
+  `MINGW_BIN` を指定すれば Qt の MinGW 11.2 も使えます。
+- インストーラは未署名です。Windows SmartScreen の警告が出ます。MIT ライセンス（`LICENSE`）を同梱します。
+- アイコンは `resources/icons/`（角丸の黄色い五芒星の PNG / ICO）。作り直すときは
+  `python3 packaging/icons/make_icon.py`（Pillow が必要）を実行します。
+- 画面からの COM ポート選択、接続、一覧、ZMODEM 転送は Windows 実機で確認してください。
+- `sgnano_remote_zmodem_selftest` は socketpair を使うため Linux だけで組みます。
+
 ## 試し（2026-11-14）
 - `ctest --test-dir build --output-on-failure`: 実機なしの試しを CTest から実行する
 - `build/sgnano_remote_selftest`: 実機なし。`RemoteProtocol` に答えを流し込み、DEL / REN / MKDIR の送る行（REN はタブ区切り）、OK / ERR の受け取り、
@@ -58,6 +81,9 @@ cmake -B build -G Ninja && ninja -C build
   64 MB を越えるファイルは 2 MB ずつになる。2 MB で `no memory` になるときは `SGNANO_ZM_PART=1048576` で 1 MB ずつにできるが、`JOIN` は 64 個までなので 64 MB まで
 - 実機の確認（2026-11-14、B: exFAT。この実機には NTFS 区画なし）: `--device`・`--device-large`・`--device-many` が成功。
   4 MB + 123 バイトの 1 MB 分割 → ZMODEM → JOIN → ダウンロード、64 KB の COPY / SPLIT / JOIN、34 フォルダの一括削除を確認
+- Windows 実機の確認（2026-11-15、Windows 10/11 x64、COM24）: `--device` と `--device-large` が成功。
+  COM ポートでの同期・DRIVES・S:・SYSFSCK・exFAT の MKDIR/REN/DEL、4 MB + 123 バイトの分割 ZMODEM → JOIN → ダウンロード、
+  64 KB の COPY / SPLIT / JOIN を確認
 
 ## 実機で残っていること（2026-11-14）
 - **64 MB 超（できれば 500 MB）の単一ファイル**: 積み残し #79 の対応後。現状は ZMODEM の 1 ファイル 4 MB と JOIN の 64 個上限で不可

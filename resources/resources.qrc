@@ -1,0 +1,12 @@
+<RCC>
+    <qresource prefix="/icons">
+        <file>icons/sgnano_remote_16.png</file>
+        <file>icons/sgnano_remote_32.png</file>
+        <file>icons/sgnano_remote_48.png</file>
+        <file>icons/sgnano_remote_64.png</file>
+        <file>icons/sgnano_remote_128.png</file>
+        <file>icons/sgnano_remote_256.png</file>
+        <file alias="sgnano_remote.png">icons/sgnano_remote_512.png</file>
+        <file>icons/sgnano_remote.ico</file>
+    </qresource>
+</RCC>
