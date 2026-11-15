@@ -1,96 +1,460 @@
 # sgnano_remote
 
-sgnano の UART の遠隔コマンド（`@SG` で答える行、sgnano の `src/input/sgremote.c`・`src/filer/sgremote_work.c`）を使う、PC 側の 2 画面のファイル管理（Qt 6）。
-左が PC、右が sgnano。転送は PC 側の内蔵 ZMODEM（`src/zmodem.cpp`、sgnano の `src/filer/zmodem.c` と同じ決まり）で行い、
-外部の実行ファイル（`scripts/zm.py`・lrzsz・python）は使わない。
+![sgnano_remote のアイコン](resources/icons/sgnano_remote_256.png)
 
-## できること
-- 接続（シリアルポートとボーレート、既定 `/dev/ttyACM0` 921600）、ドライブの一覧、フォルダの一覧（名前・大きさ・更新日時・属性）、移動
-- **S:（内蔵フラッシュ、4 MB、FAT12）** に対応（2026-10-24、2026-11-02 に 2 MB から 4 MB へ。sgnano の `src/storage/sysdisk.c`）。
-  本体は USB のドライブを A から順に S を飛ばす。S: のルートの `SystemSettings`・`SystemFiles`・`SystemLogs` は
-  システムのフォルダで、消す・名前を変える操作は送らずに断る（本体も `EACCES` で断る）。
-  2026-11-02 に増えたルートの `bin`・`sbin` は本体が守らないので、このアプリも守らない
-- アップロード・ダウンロード（ボタン、ドラッグ・アンド・ドロップ）。PC 側の内蔵 ZMODEM で送る・受け取る
-  （2026-10-24。`ZPUT` / `ZGET` のあと、sgnano の `zm_receive` / `zm_send` と話す。外部の実行ファイルは要らない）。
-  受け取りは CRC16 で送り、16 進・2 進（CRC32 も）の見出しを読む。名前は 131 バイトまで。
-  **4 MB を越えるダウンロード**は、本体が送りながら機器から読む（2026-10-29）ので、そのまま受け取れる。
-  **4 MB を越えるアップロード**は、PC で `name.001 …` に分けて送り、本体の `JOIN` でつないでから分割ファイルを消す
-  （2026-11-14。既定は 64 MB 以下なら 1 つ 1 MB、64 MB を越えるものは 2 MB。`SGNANO_ZM_PART` で 512 の倍数に固定できる。本体の JOIN は 64 個まで）
-- **新しいフォルダ・名前の変更（F2）・削除（Delete、確かめる。複数可。フォルダは空のときだけ）**（2026-10-23。sgnano の `MKDIR` / `REN` / `DEL`）。
-  ボタンと右クリックのメニュー。終わったら一覧を読み直し、できなかった操作はまとめて知らせる。
-  多数の削除は `RemoteDeleteQueue` で 8 件ずつ順に送る（`RemoteProtocol` の待ち行列をあふれさせない）。
-  削除などの操作中は、移動・更新・パス入力を受け付けない
-- **リモート内のコピー**（2026-11-14。sgnano の `COPY`、2026-10-24）: 右クリックの「コピー（リモート内）」でファイルを 1 つ選び、
-  移動先のフォルダで「貼り付け」。元は FAT・フロッピー・exFAT・NTFS・データ CD、先は FAT・フロッピー・exFAT・NTFS。
-  同じ名前は置き換える。**同じ exFAT の中の 4 MB 級のコピーは、本体が `read error` で失敗することがある**（積み残し #80。1.5 MB 級は成功）
-- **結合と分割**（2026-11-14。sgnano の `JOIN` / `SPLIT`、2026-10-24）: 右クリックの「結合 (.001)…」で `name.001` から
-  `.002`、`.003` … をつなぐ。「分割 (4 MB ずつ)…」で `name.001 …` を作る。どちらも同じフォルダの中で、同名は置き換える
-- **S: の検査と修復**（2026-11-14。sgnano の `SYSFSCK`、2026-11-12）: S: を開いているときの右クリックから「S: を検査…」
-  「S: を修復…」。ファイル・フォルダの数、直した大きさ・空きにした鎖・交差・壊れた鎖・FAT2 の数を出す
-- `DRIVES` の追加の欄（USB の台番号 `msc`・区画の先頭 `plba`、2026-11-08）も読む。古い本体の 5 欄の形でも動く
+**sgnano_remote** は、自作パソコン **sgnano** のファイルを PC から管理するためのデスクトップアプリです。
+
+sgnano は、Raspberry Pi RP2350B を使った自作のビデオコンソールです。VGA 画面、USB キーボード・マウス、USB ストレージ、音源、ファイル管理などを備えています。
+このアプリは、PC と sgnano を **UART（シリアルポート）** でつなぎ、PC 側のファイルと sgnano 側のファイルを 2 画面で並べて操作できるようにします。
+
+- 左側: PC のファイル
+- 右側: sgnano のファイル
+- ファイルのアップロード・ダウンロード
+- フォルダの作成・名前の変更・削除
+- sgnano の中でのコピー・分割・結合
+- 内蔵フラッシュ **S:** の検査・修復
+
+Windows 10/11 x64 と Linux で動きます。Windows 用には、管理者権限が不要な per-user インストーラを用意しています。
+
+---
+
+## 特長
+
+- **外部ツールが不要**
+  - ファイル転送はアプリに内蔵した ZMODEM で行います。
+  - `lrzsz`、Python、`scripts/zm.py` などの外部プログラムは使いません。
+- **PC と sgnano の 2 画面**
+  - ローカルのファイルを選んでアップロード
+  - sgnano のファイルを選んでダウンロード
+  - ドラッグ・アンド・ドロップにも対応
+- **大きなファイル**
+  - 4 MB を越えるダウンロードは、sgnano が送りながら機器から読むため、そのまま受け取れます。
+  - 4 MB を越えるアップロードは、PC 側で自動的に分割して送り、sgnano 側で結合します。
+- **sgnano の内蔵フラッシュ S: に対応**
+  - S: は 4 MB の FAT12 です。
+  - `SystemSettings`、`SystemFiles`、`SystemLogs` はシステムのフォルダで、削除・名前の変更はできません。
+  - ルートの `bin`、`sbin` はシステムのフォルダではないため、このアプリでも保護しません。
+  - S: の FAT12 を検査・修復できます。
+- **リモート内のファイル操作**
+  - sgnano の中でのコピー
+  - `.001`、`.002` … の結合
+  - 1 ファイルの分割
+- **MIT ライセンス**
+  - ソースコードは MIT ライセンスです。
+
+---
+
+## 必要なもの
+
+### sgnano 側
+
+- sgnano 本体（RP2350B ボード）
+- 遠隔コマンドに対応したファームウェア
+- PC とつなぐための UART
+  - Raspberry Pi Debug Probe などの USB シリアル変換
+  - ボーレートは既定で **921600**
+- sgnano が **ファイラー画面**（ファイル一覧）を表示していること
+  - Doom や Ruby などのプログラムが動いている間は、遠隔コマンドを受け付けないことがあります。
+
+### PC 側
+
+- Windows 10/11 x64
+  - USB シリアルの COM ポートが見えること
+- または Linux
+  - Qt 6.2 以降
+  - `/dev/ttyACM0` などのシリアルポート
+
+---
+
+## インストール
+
+### Windows
+
+配布されている `sgnano_remote_setup_*.exe` を実行してください。
+
+- **per-user インストール**です。管理者権限は不要です。
+- インストール先の既定:
+  ```
+  %LOCALAPPDATA%\Programs\sgnano_remote
+  ```
+- スタートメニューとデスクトップにショートカットを作ります。
+- アンインストールは、スタートメニューの「アンインストール」か、Windows の「アプリと機能」から行えます。
+
+> **注意**
+>
+> 現在のインストーラはコード署名をしていません。Windows SmartScreen で
+> 「Windows によって PC が保護されました」と表示されることがあります。
+> 内容を確認したうえで「詳細情報」→「実行」を選んでください。
+
+### Linux
+
+下の「ビルド」からソースコードでビルドしてください。
+
+---
+
+## 使い方
+
+### 1. 接続する
+
+1. sgnano をファイラー画面にします。
+2. PC と sgnano を UART でつなぎます。
+3. アプリを起動します。
+4. シリアルポートを選びます。
+   - Linux: `/dev/ttyACM0` など
+   - Windows: `COM3`、`COM24` など
+5. ボーレートを **921600** にします（sgnano の既定）。
+6. 「接続」を押します。
+
+接続すると、sgnano のドライブ一覧と、現在のフォルダの一覧を読み込みます。
+
+### 2. 画面の見方
+
+- 左側: PC のファイル
+- 右側: sgnano のファイル
+- 右側の上:
+  - ドライブの選択
+  - 現在のパス
+  - 受信したバイト数
+- 「上へ」「更新」でフォルダを移動・再読み込み
+- 「新しいフォルダ」「名前の変更」「削除」でファイル操作
+- 「アップロード」「ダウンロード」でファイル転送
+
+### 3. アップロード
+
+1. 左側でファイルを選びます（複数選択できます）。
+2. 「アップロード」を押すか、右側のフォルダへドラッグ・アンド・ドロップします。
+3. 同名のファイルは上書きされます。確認のうえ実行してください。
+
+4 MB を越えるファイルは、自動的に分割して送られます。ユーザーが自分で分割する必要はありません。
+
+### 4. ダウンロード
+
+1. 右側でファイルを選びます。
+2. 「ダウンロード」を押すか、左側のフォルダへドラッグ・アンド・ドロップします。
+3. 同名のファイルは上書きされます。
+
+一度にダウンロードできるのは 1 ファイルです。
+
+### 5. フォルダ・ファイルの操作
+
+右側の一覧で右クリックすると、次のメニューが出ます。
+
+- 新しいフォルダ
+- 名前の変更（F2）
+- 削除（Delete）
+- コピー（リモート内）
+- 貼り付け
+- 結合（.001）
+- 分割（4 MB ずつ）
+- S: を検査 / 修復（S: を開いているとき）
+- 更新
+
+削除は確認のうえ実行します。フォルダは空のときだけ削除できます。
+たくさんのファイルを削除するときは、8 件ずつ順番に送ります。
+
+### 6. リモート内のコピー
+
+1. 右側でファイルを 1 つ選びます。
+2. 右クリック →「コピー（リモート内）」
+3. 移動先のフォルダを開きます。
+4. 右クリック →「貼り付け」
+
+sgnano の中だけでコピーするため、PC への転送は発生しません。
+
+### 7. 分割と結合
+
+sgnano の中にあるファイルを分割・結合できます。
+
+- **結合**: `name.001` を選び、右クリック →「結合（.001）」
+  - `.002`、`.003` … を順につないで `name` を作ります。
+- **分割**: ファイルを選び、右クリック →「分割（4 MB ずつ）」
+  - `name.001`、`name.002` … を作ります。
+
+どちらも同じフォルダの中で行い、同名のファイルは置き換えます。
+
+### 8. S: の検査と修復
+
+S: を開いているときに右クリックすると、次の項目が出ます。
+
+- **S: を検査**
+  - FAT12 のファイル・フォルダの数、壊れた鎖などを調べます。
+  - 中身は変更しません。
+- **S: を修復**
+  - ファイルの大きさ、余分な鎖、未接続のクラスタ、FAT2 などを直します。
+  - 実行前に確認のダイアログが出ます。
+
+---
+
+## 大きいファイルについて
+
+sgnano の ZMODEM は、一度に受け取れるファイルが **4 MB** までです。
+このアプリは、その制限を意識せずに使えるように次の処理をします。
+
+### ダウンロード
+
+4 MB を越えるファイルは、sgnano が送りながら機器から読みます。
+そのため、PC 側で特別な分割は不要です。
+
+### アップロード
+
+4 MB を越えるファイルは、PC 側で次のように分割します。
+
+- 64 MB 以下: 1 MB ずつ
+- 64 MB 超: 2 MB ずつ
+
+分割したファイルを ZMODEM で送り、sgnano の `JOIN` で結合したあと、分割ファイルを削除します。
+分割サイズは環境変数 `SGNANO_ZM_PART` で変更できます（512 の倍数）。
+
+### 制限
+
+- sgnano の `JOIN` は **64 個**までです。
+- 64 MB を越えるファイルは、2 MB ずつにしても sgnano 側のメモリ不足や制限で失敗することがあります。
+- 現在、**500 MB 程度の単一ファイル**をこの経路で送ることはできません。
+- 大きなファイルを確実に移したい場合は、USB メモリ／USB-HDD にコピーして sgnano に接続する方法をおすすめします。
+  - sgnano は FAT / exFAT / NTFS の USB ストレージを読めます。
+
+---
+
+## 制限と注意
+
+- Windows インストーラは未署名です。SmartScreen の警告が出ます。
+- ZMODEM の 1 ファイルの上限は 4 MB です。
+- sgnano の `JOIN` は 64 個までです。
+- 同一 exFAT 内の 4 MB 級のコピーは、sgnano 本体側の `read error` で失敗することがあります。
+- sgnano のプログラム（Doom・Ruby・Python など）が動いている間は、遠隔コマンドが拒否されることがあります。ファイラー画面に戻ってから操作してください。
+- ファイル操作中は、一覧の移動・更新・パス入力を一時的に受け付けません。
+- 通信が止まったときは、いったん切断して接続し直してください。
+- NTFS への対応は実装していますが、手元の実機に NTFS 区画が無いため、NTFS での実機試験は未実施です。
+
+### 主なショートカット
+
+| キー | 動作 |
+|---|---|
+| `F5` | リモートの一覧を更新 |
+| `Ctrl+R` | ローカルの一覧を更新 |
+| `Alt+Up` | リモートで親フォルダへ |
+| `Ctrl+U` | アップロード |
+| `Ctrl+D` | ダウンロード |
+| `F2` | 名前の変更 |
+| `Delete` | 削除 |
+| `Ctrl+Shift+C` | 接続 / 切断 |
+| `Ctrl+Shift+L` | シリアルログの表示切り替え |
+
+---
 
 ## ビルド
+
+### Linux
+
+必要なもの:
+
+```bash
+sudo apt install build-essential cmake ninja-build qt6-base-dev
 ```
-cmake -B build -G Ninja && ninja -C build
+
+ビルド:
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
-## Windows 版（2026-11-15）
-Windows 10/11 x64 に対応しました。シリアルは COM ポート（既定は見つかった COM、無ければ COM3）、
-インストーラは **per-user**（管理者不要、`%LOCALAPPDATA%\Programs\sgnano_remote`）です。
+起動:
 
-- Windows 実機で Qt と MinGW/MSVC を使って組む場合:
-  ```
-  powershell -ExecutionPolicy Bypass -File packaging\windows\build-windows.ps1 -QtDir C:\Qt\6.2.4\mingw_64
-  ```
-  `makensis.exe` と Qt の `windeployqt.exe` が必要です。完成物は `build-windows\sgnano_remote_setup_0.1.0.exe`。
-- WSL からクロスビルドする場合:
-  ```
-  sudo apt install g++-mingw-w64-x86-64 nsis
-  QT_DIR=~/Qt/6.2.4/mingw_64 packaging/windows/build-wsl.sh
-  ```
-  Linux 側の Qt 6 のホストツール（`QT_HOST_PATH`、既定 `/usr/lib/x86_64-linux-gnu/cmake`）も必要です。
-  Qt の DLL は GCC 11.2 製ですが、アプリ側の libstdc++/libgcc は静的に結ぶので、Ubuntu の MinGW（GCC 10）でも起動できます。
-  `MINGW_BIN` を指定すれば Qt の MinGW 11.2 も使えます。
-- インストーラは未署名です。Windows SmartScreen の警告が出ます。MIT ライセンス（`LICENSE`）を同梱します。
-- アイコンは `resources/icons/`（角丸の黄色い五芒星の PNG / ICO）。作り直すときは
-  `python3 packaging/icons/make_icon.py`（Pillow が必要）を実行します。
-- 画面からの COM ポート選択、接続、一覧、ZMODEM 転送は Windows 実機で確認してください。
-- `sgnano_remote_zmodem_selftest` は socketpair を使うため Linux だけで組みます。
+```bash
+./build/sgnano_remote
+```
 
-## 試し（2026-11-14）
-- `ctest --test-dir build --output-on-failure`: 実機なしの試しを CTest から実行する
-- `build/sgnano_remote_selftest`: 実機なし。`RemoteProtocol` に答えを流し込み、DEL / REN / MKDIR の送る行（REN はタブ区切り）、OK / ERR の受け取り、
-  断る形（空・制御文字・待ち行列がいっぱい）、待っていない OK を受け流すこと、並べた要求を 1 つずつ送ることを確かめる。
-  2026-11-14 に足した `COPY`・`JOIN`・`SPLIT`・`SYSFSCK` の送る行と戻り、`DRV` の `msc` / `plba`、319 / 320 バイトの境目も確かめる。
-  `RemoteDeleteQueue` の 8 件ずつの送信、34 件以上の完走、途中失敗、タイムアウト、同期的な返事も確かめる。
-  S: の見分け（`RemoteFs::isSystemDrivePath`）と、システムのフォルダの守り（`RemoteFs::isProtectedSystemPath`）、`DRIVES` の S: の受け取りも確かめる
-- `build/sgnano_remote_zmodem_selftest`: 実機なし。内蔵 ZMODEM の送る側と受け取る側を socketpair で向かい合わせ、
-  複数ファイル・300 KB・空のファイル・逃がす文字（ZDLE / XON / XOFF / CR / 0x7F / 0xFF）の中身と名前・数を確かめる
-- `build/sgnano_remote_uploadsplit_selftest`: 実機なし。分割の大きさの選び方（64 MB 以下は 1 MB、64 MB 超は 2 MB。`SGNANO_ZM_PART` があればその値）、
-  4 MB を越えるファイルを 2 MB ずつに分けること、名前（.001 を含めて 131 バイト）、64 個の上限、`SGNANO_ZM_PART` の読み取りを確かめる
-- `build/sgnano_remote_selftest --device /dev/ttyACM0`: 実機あり。`DRIVES` の種類で **HDD の exFAT（3）と NTFS（4）のうち、準備できた区画だけ**を選び（ドライブ文字はつなぐ順で変わる。無い種類は飛ばす）、
-  作る・一覧で確かめる・空白を含む名前に変える・中身のあるフォルダの削除を断られる・消す・残っていないことを通す。作ったもの（`!qt_selftest`）は消してから終わる。
-  S:（内蔵フラッシュ）があること、そのルートの 3 つのシステムのフォルダがシステムの属性で並ぶこと、
-  `SYSFSCK`（検査だけ）が答えることも見る（消す・名前を変える試しはしない）
-- `build/sgnano_remote_selftest --device-many /dev/ttyACM0`: 実機あり。同じく準備できた exFAT / NTFS に 34 個のフォルダを作り、`RemoteDeleteQueue` で 8 件ずつ消して、
-  全部残らず消えたことを確かめる。作ったもの（`!qt_selftest_many`）は消してから終わる
-- `build/sgnano_remote_selftest --device-large /dev/ttyACM0`: 実機あり。exFAT / NTFS のフォルダへ **4 MB + 123 バイト**のファイルをアップロードし、
-  PC で 1 MB ずつに分ける → ZMODEM → 実機の `JOIN` → 分割ファイルの `DEL` まで通ることと、同じファイルをダウンロードして中身が一致することを確かめる。
-  そのあと COPY（リモート内）と、実機の `SPLIT` / `JOIN` も見る。作ったもの（`!qt_selftest_large`）は消してから終わる。時間がかかる（4 MB 超を 2 回転送する）。
-  JOIN の間、実機の「split / join: … KB」の表示が 65536 KB（64 MB）で止まる（積み残し #79。転送も 64 MB までで止まるという報告あり）。
-  64 MB を越えるファイルは 2 MB ずつになる。2 MB で `no memory` になるときは `SGNANO_ZM_PART=1048576` で 1 MB ずつにできるが、`JOIN` は 64 個までなので 64 MB まで
-- 実機の確認（2026-11-14、B: exFAT。この実機には NTFS 区画なし）: `--device`・`--device-large`・`--device-many` が成功。
-  4 MB + 123 バイトの 1 MB 分割 → ZMODEM → JOIN → ダウンロード、64 KB の COPY / SPLIT / JOIN、34 フォルダの一括削除を確認
-- Windows 実機の確認（2026-11-15、Windows 10/11 x64、COM24）: `--device` と `--device-large` が成功。
-  COM ポートでの同期・DRIVES・S:・SYSFSCK・exFAT の MKDIR/REN/DEL、4 MB + 123 バイトの分割 ZMODEM → JOIN → ダウンロード、
-  64 KB の COPY / SPLIT / JOIN を確認
+設定は `~/.config/sgnano/sgnano_remote.conf` に保存されます。
 
-## 実機で残っていること（2026-11-14）
-- **64 MB 超（できれば 500 MB）の単一ファイル**: 積み残し #79 の対応後。現状は ZMODEM の 1 ファイル 4 MB と JOIN の 64 個上限で不可
-- **NTFS 区画での `--device` / `--device-large`**: この実機には NTFS 区画が無いため未実施
-- **UI からの COPY / SPLIT / JOIN / SYSFSCK の手操作**: 遠隔コマンドとしては `--device` / `--device-large` で確認済み。画面からの操作は未確認
-- **同一 exFAT 内の 4 MB 級 COPY**: 本体の read error（積み残し #80）。アプリ側では回避できない
+### Windows（Windows 上でビルドする場合）
+
+必要なもの:
+
+- Qt 6.2 以降（MinGW または MSVC）
+- CMake
+- Ninja
+- NSIS（`makensis.exe`）
+- Qt の `windeployqt.exe`
+
+PowerShell から:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\build-windows.ps1 `
+    -QtDir C:\Qt\6.2.4\mingw_64 `
+    -MinGWPath C:\Qt\Tools\mingw1120_64\bin
+```
+
+完成物:
+
+```
+build-windows\sgnano_remote_setup_0.1.0.exe
+```
+
+### Windows（WSL からクロスビルドする場合）
+
+WSL に MinGW と NSIS を入れます。
+
+```bash
+sudo apt install g++-mingw-w64-x86-64 nsis
+```
+
+Qt の Windows 版と、Linux 側の Qt ホストツールを用意して実行します。
+
+```bash
+QT_DIR=~/Qt/6.2.4/mingw_64 packaging/windows/build-wsl.sh
+```
+
+- Qt 6.2.4 の Windows DLL は GCC 11.2 でビルドされています。
+- アプリ側の `libstdc++` / `libgcc` は静的に結ぶため、Ubuntu の MinGW（GCC 10）でも起動できます。
+- `MINGW_BIN` を指定すると、別の MinGW を使えます。
+
+### アイコン
+
+アイコンの元画像と Windows 用 `.ico` は `resources/icons/` にあります。
+作り直す場合:
+
+```bash
+python3 packaging/icons/make_icon.py
+```
+
+Pillow が必要です。
+
+---
+
+## 試し
+
+実機がなくても、プロトコルと ZMODEM の試しを実行できます。
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+- `sgnano_remote_selftest`
+  - 遠隔コマンドの送信・応答
+  - S: のシステムフォルダの見分け
+  - 削除待ち行列
+- `sgnano_remote_zmodem_selftest`
+  - ZMODEM の送受信（Linux のみ）
+- `sgnano_remote_uploadsplit_selftest`
+  - 4 MB 超のファイルの分割
+
+### 実機の試し
+
+```bash
+# Linux
+./build/sgnano_remote_selftest --device /dev/ttyACM0
+
+# Windows（例）
+build-windows\sgnano_remote_selftest.exe --device COM24
+```
+
+`--device` は、sgnano の exFAT / NTFS の区画に `!qt_selftest` などのテスト用フォルダを作り、終わったら削除します。
+S: は読み取りだけを確認します。
+
+大きいファイルの試し:
+
+```bash
+./build/sgnano_remote_selftest --device-large /dev/ttyACM0
+```
+
+- 4 MB + 123 バイトのアップロード
+- 分割 → ZMODEM → JOIN
+- ダウンロードと中身の比較
+- COPY / SPLIT / JOIN
+
+多数の削除の試し:
+
+```bash
+./build/sgnano_remote_selftest --device-many /dev/ttyACM0
+```
+
+> 実機の試しは、テスト用のフォルダを作成・削除します。
+> 大切なデータがあるドライブでは実行しないでください。
+
+---
+
+## 仕組み
+
+このアプリは、sgnano の UART 遠隔コマンドを使います。
+
+- コマンドは `0x1E` で始まる 1 行
+- 応答は `@SG` で始まる行
+- 主なコマンド:
+  - `PING`、`CWD`、`DRIVES`
+  - `LIST`、`STAT`
+  - `MKDIR`、`REN`、`DEL`
+  - `COPY`、`SPLIT`、`JOIN`
+  - `SYSFSCK`
+  - `ZPUT`、`ZGET`
+- ファイル転送:
+  - `src/zmodem.cpp` の内蔵 ZMODEM
+  - 4 MB 超のアップロードは `src/uploadsplit.cpp` で分割
+- Windows のシリアル:
+  - `src/win32serial.cpp`
+  - 通常の遠隔コマンドは QTimer で読み取り
+  - ZMODEM は専用スレッドで読み書き
+
+主なファイル:
+
+| ファイル | 役割 |
+|---|---|
+| `src/mainwindow.cpp` | アプリ全体、メニュー、転送の進行 |
+| `src/localpane.cpp` | PC 側の一覧 |
+| `src/remotepane.cpp` | sgnano 側の一覧と操作 |
+| `src/remoteprotocol.cpp` | 遠隔コマンドの送受信 |
+| `src/zmodem.cpp` | 内蔵 ZMODEM |
+| `src/zmodemworker.cpp` | 転送スレッド |
+| `src/uploadsplit.cpp` | 4 MB 超の分割 |
+| `src/win32serial.cpp` | Windows の COM ポート |
+
+---
+
+## 困ったとき
+
+### シリアルポートが見つからない
+
+- Linux:
+  ```bash
+  ls /dev/ttyACM* /dev/ttyUSB*
+  ```
+  `dialout` グループに入っているか確認してください。
+  ```bash
+  sudo usermod -aG dialout "$USER"
+  ```
+  反映にはログインし直しが必要です。
+- Windows:
+  - デバイスマネージャーで COM ポートを確認
+  - USB シリアルのドライバーが入っているか確認
+  - アプリのポート欄には `COM3` のように入力できます
+
+### 接続しても一覧が出ない
+
+- sgnano がファイラー画面か確認してください
+- Doom・Ruby・Python などのプログラムが動いていないか確認してください
+- ボーレートが 921600 か確認してください
+- いったん切断して接続し直してください
+
+### 転送が始まらない・止まった
+
+- sgnano 側に ZMODEM の状態が残っている可能性があります
+- アプリで切断 → 接続し直すと、残留状態を取り消します
+- それでもだめなら、sgnano を再起動してください
+
+### 大きなファイルが送れない
+
+- 4 MB を越えるファイルは自動分割されます
+- 64 MB を越えるファイルは制限があります
+- 500 MB 級は USB ストレージを使ってください
+
+### SmartScreen の警告が出る
+
+- インストーラが未署名のためです
+- 「詳細情報」→「実行」で進めます
+- 配布時にコード署名を追加することもできます
+
+---
 
 ## ライセンス
-MIT License（[`LICENSE`](LICENSE)）。
 
+MIT License です。詳しくは [`LICENSE`](LICENSE) を読んでください。
