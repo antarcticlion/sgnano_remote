@@ -90,3 +90,7 @@ Windows 10/11 x64 に対応しました。シリアルは COM ポート（既定
 - **NTFS 区画での `--device` / `--device-large`**: この実機には NTFS 区画が無いため未実施
 - **UI からの COPY / SPLIT / JOIN / SYSFSCK の手操作**: 遠隔コマンドとしては `--device` / `--device-large` で確認済み。画面からの操作は未確認
 - **同一 exFAT 内の 4 MB 級 COPY**: 本体の read error（積み残し #80）。アプリ側では回避できない
+
+## ライセンス
+MIT License（[`LICENSE`](LICENSE)）。
+
