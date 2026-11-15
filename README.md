@@ -16,6 +16,10 @@ sgnano は、Raspberry Pi RP2350B を使った自作のビデオコンソール�
 
 Windows 10/11 x64 と Linux で動きます。Windows 用には、管理者権限が不要な per-user インストーラを用意しています。
 
+![sgnano_remote の画面。左が PC、右が sgnano のファイル一覧](images/sgnano_remote_app_01.png)
+
+*左が PC、右が sgnano のファイル一覧です。つないだあとは、右側に sgnano のファイルが並びます。*
+
 ---
 
 ## 特長
@@ -108,6 +112,8 @@ Windows 10/11 x64 と Linux で動きます。Windows 用には、管理者権�
 接続すると、sgnano のドライブ一覧と、現在のフォルダの一覧を読み込みます。
 
 ### 2. 画面の見方
+
+全体のようすは、上の画面写真を参照してください。
 
 - 左側: PC のファイル
 - 右側: sgnano のファイル
